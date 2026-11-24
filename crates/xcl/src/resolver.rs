@@ -248,8 +248,14 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
             Err(e) => crate::xlog_error!("failed to load {}: {e}", path.display()),
         }
     }
-    // Real Windows DLL
+    // Real Windows DLL. Only title calls resolved from the real ntdll get
+    // lazy-buffer preparation, not XCL's or Windows' native I/O.
     if let Some(a) = system_proc(key, what) {
+        if key == "ntdll.dll" {
+            if let Some(w) = crate::vfs_hooks::native_file_io_override(what, a) {
+                return Some((w, Source::Hle("ntdll lazy file I/O".into())));
+            }
+        }
         return Some((a, Source::System(key.to_string())));
     }
     // A known console function imported from an unexpected DLL
@@ -432,6 +438,10 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
     if n > 0 {
         let full = String::from_utf16_lossy(&buf[..n as usize]);
         let key = dll_key(&full);
+        if key == "ntdll.dll" && reg.route(&key).is_none() {
+            let a = system_proc_in(h, what)?;
+            return Some(crate::vfs_hooks::native_file_io_override(what, a).unwrap_or(a));
+        }
         if let Some(m) = reg.hle_for(&key) {
             if let ImportName::Name { name, .. } = what {
                 if let Some(&a) = m.exports.get(name.as_str()) {

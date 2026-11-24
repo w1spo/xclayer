@@ -77,6 +77,14 @@ next steps:
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
 
+## Fork diagnostics (Patch 19)
+
+`detailed.txt` now includes `title_allocations`: live default XMem logical bytes, live logical physical-page bytes (a page is counted once regardless of its mapping), and explicitly committed bytes in tracked plain Windows virtual reservations. These categories are partial, not a total title-memory or host-commit figure; do not add them to process private bytes or GPU budgets. `TitleMemoryStatus` retains the existing policy and `XCL_TITLE_MEMORY_STRICT` override until all allocation paths are covered. `None` means a snapshot could not acquire its diagnostic lock.
+
+Title imports and title `GetProcAddress` lookups of the real `ntdll.dll!NtReadFile` / `NtWriteFile` prepare lazy data and metadata buffers, then call the native Windows API unchanged. Raw syscalls, other native file APIs and native path redirection are not implemented. Explicit resolver aliases continue to take precedence.
+
+A fresh, previously reserved plain-memory physical mapping of up to 64 MiB can stage its needed commits and roll them back if staging fails. Larger, overlapping and sparse mappings are not fully transactional. Failure to recommit a physical page's home now prevents unmapping that page. These fork changes require Windows and GPU regression validation.
+
 ## Controls
 
 A **gamepad is recommended**: console games are made for one, and their menus and controls expect it.
@@ -107,6 +115,7 @@ next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, o
   size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
   pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
   `report.json` has it under `dxc`.
+- **System commit:** preflight warns when system-wide commit headroom is below 24 GiB. This is advisory, not a minimum requirement; check the system-managed Windows page file and available disk space.
 - **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
   mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
   (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange

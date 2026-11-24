@@ -1421,12 +1421,15 @@ pub(super) unsafe fn place_at_title_address(this: *mut c_void, va: usize, desc: 
     // the difference where PC methods take an offset into it (`buffer_delta`)
     let start = va & !0xFFFF;
     let delta = va - start;
-    if bytes == 0 || va - base + bytes > size {
+    if bytes == 0 || (va - base).checked_add(bytes).is_none_or(|end| end > size) {
         return None;
     }
     // the title's own memory (a sparse window): a resource over its video-memory tiles
     if u.is_sparse(va) {
         let (hr, delta) = super::sparse::place_buffer(this, va, &d, state, riid, ppv)?;
+        if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+            return Some(hr);
+        }
         UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (va, bytes, false));
         if delta != 0 {
             BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, delta as u64);
@@ -2122,18 +2125,36 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
     })
 }
 
+type MadeKey = (usize, u64, [u8; 0x38]);
+
+/// Return the cached winner, leaving its owning reference in the map. A concurrent
+/// successful miss must not replace that reference (live descriptors may name it).
+fn remember_made(cache: &mut HashMap<MadeKey, usize>, key: MadeKey, hr: i32, resource: usize) -> usize {
+    if hr < 0 || resource == 0 {
+        return 0;
+    }
+    *cache.entry(key).or_insert(resource)
+}
+
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    type Key = (u64, [u8; 0x38]);
-    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    static MADE: Mutex<Option<HashMap<MadeKey, usize>>> = Mutex::new(None);
+    // Only misses enter this gate. Creating a second texture at the same address
+    // can shadow the first one before either descriptor is published.
+    static CREATE: Mutex<()> = Mutex::new(());
     if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
         return std::ptr::null_mut();
     }
     // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
     let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     x[0x34..].fill(0);
-    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+    let key = (this as usize, va, x);
+    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&key) {
+        return r as *mut c_void;
+    }
+    let _create = CREATE.lock().unwrap();
+    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&key) {
         return r as *mut c_void;
     }
     let mut r = std::ptr::null_mut();
@@ -2145,8 +2166,10 @@ unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_voi
         }
         r = std::ptr::null_mut();
     }
-    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
-    r
+    // (only a resource that was made is kept: a failure – the memory not backed yet, no video
+    // memory at that moment – must not stand for good, as the title asks again)
+    let winner = remember_made(MADE.lock().unwrap().get_or_insert_with(HashMap::new), key, hr, r as usize);
+    winner as *mut c_void
 }
 
 /// device #70 (a retail game): a shader resource view of memory, without a resource object:
@@ -2196,8 +2219,10 @@ fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI
         }
         (false, s) => (s, s),
     };
-    let records = if stride == 0 { n.saturating_mul(4) } else { n };
-    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+    // No resource size is provided by this ABI. At least require the complete
+    // descriptor range to fit the 48-bit address and 14-bit stride fields.
+    let Some((base, records)) = checked_buffer_range(va, u64::MAX, first, n, stride, elem) else { return [0; 4] };
+    crate::gpu::desc::buffer_words(base, stride, records, fmt)
 }
 
 unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
@@ -5157,6 +5182,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    super::present::register_queue(this);
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
     // console-shaped lists run as the PC lists they were translated into (split title lists expand
@@ -5194,8 +5220,6 @@ pub fn drain_gpu() {
         // a fence per queue (they finish in any order)
         let mut fences = Vec::new();
         for q in super::present::known_queues() {
-            let qr = q as *mut c_void;
-            let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qr) else { continue };
             let submit = || {
                 let f: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)
                     .map_err(|e| fence::api_error(dev, "CreateFence", e))?;
@@ -5841,7 +5865,40 @@ mod console_format_query_tests {
 
 #[cfg(test)]
 mod checked_descriptor_stream_tests {
+    #[test]
+    fn failed_resource_creation_is_not_cached() {
+        let mut cache = std::collections::HashMap::new();
+        let key = (1, 0x10000, [0u8; 0x38]);
+        super::remember_made(&mut cache, key, -1, 0);
+        assert!(!cache.contains_key(&key));
+        super::remember_made(&mut cache, key, 0, 0);
+        assert!(!cache.contains_key(&key));
+        super::remember_made(&mut cache, key, 0, 0x1234);
+        assert_eq!(cache.get(&key), Some(&0x1234));
+    }
+
+    #[test]
+    fn made_cache_keeps_first_resource_and_separates_devices() {
+        let mut cache = std::collections::HashMap::new();
+        let a = (1, 0x10000, [0; 0x38]);
+        let b = (2, 0x10000, [0; 0x38]);
+        assert_eq!(super::remember_made(&mut cache, a, 0, 10), 10);
+        assert_eq!(super::remember_made(&mut cache, a, 0, 20), 10);
+        assert_eq!(super::remember_made(&mut cache, b, 0, 30), 30);
+        assert_eq!(cache.len(), 2);
+    }
+
     use super::*;
+
+    #[test]
+    fn address_only_buffer_descriptors_reject_unrepresentable_ranges() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT;
+        assert_eq!(buffer_words_at(0x10000, DXGI_FORMAT_R32_UINT, u64::MAX, 1, 4, false), [0; 4]);
+        assert_eq!(buffer_words_at((1u64 << 48) - 4, DXGI_FORMAT_R32_UINT, 0, 2, 4, false), [0; 4]);
+        assert_eq!(buffer_words_at(0x10000, DXGI_FORMAT_R32_UINT, 0, 1, 0x4000, false), [0; 4]);
+        let raw = buffer_words_at(0x10000, DXGI_FORMAT_R32_UINT, 0, u32::MAX, 0, true);
+        assert_eq!(raw[2], u32::MAX - 3);
+    }
 
     #[test]
     fn buffer_range_does_not_wrap_or_truncate_record_count() {

@@ -153,6 +153,25 @@ fn xgameruntime_present() -> bool {
     std::path::Path::new(&root).join("System32").join("xgameruntime.dll").is_file()
 }
 
+/// System-wide commit headroom, not free RAM or the process's private bytes.
+fn commit_check(limit_pages: usize, used_pages: usize, page_size: usize) -> Option<Check> {
+    if page_size == 0 { return None; }
+    let available = limit_pages.saturating_sub(used_pages).saturating_mul(page_size);
+    (available < 24usize << 30).then(|| check(Level::Warning,
+        format!("system commit headroom: {} MiB (under 24 GiB; large streaming titles may run out)", available >> 20),
+        Some("close other memory-heavy programs; check Windows virtual memory / system-managed page file and free disk space")))
+}
+
+fn probe_commit() -> Option<Check> {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, PERFORMANCE_INFORMATION};
+    let mut info: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as u32;
+    if unsafe { K32GetPerformanceInfo(&mut info, size) } == 0 {
+        return Some(check(Level::Note, "system commit headroom could not be queried", None));
+    }
+    commit_check(info.CommitLimit, info.CommitTotal, info.PageSize)
+}
+
 /// Check this PC for a run with the adapter `setting`.
 pub fn run(setting: &str) -> Vec<Check> {
     let found = Found {
@@ -161,7 +180,9 @@ pub fn run(setting: &str) -> Vec<Check> {
         xgameruntime: xgameruntime_present(),
         gpu: probe_gpu(setting),
     };
-    checks(&found)
+    let mut result = checks(&found);
+    result.extend(probe_commit());
+    result
 }
 
 /// The checks as console lines: OK ones first as `  label`, the rest as WARNING / ERROR with
@@ -184,6 +205,16 @@ pub fn print(checks: &[Check]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_system_commit_is_a_warning_not_a_startup_error() {
+        let pages = (24usize << 30) / 4096;
+        assert!(commit_check(pages + 10, 10, 4096).is_none());
+        let warning = commit_check(pages + 9, 10, 4096).unwrap();
+        assert_eq!(warning.level, Level::Warning);
+        assert!(warning.fix.unwrap().contains("page file"));
+        assert!(commit_check(1, 2, 4096).unwrap().what.contains("0 MiB"));
+    }
 
     fn gpu() -> Gpu {
         Gpu { name: "Radeon RX 9070 (16304 MiB VRAM)".into(), warp: false, shader_model: (6, 6), no_sm66: "x: no SM 6.6".into(), mesh: true, wave_min: 32, wave_max: 64 }

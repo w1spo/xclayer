@@ -1,0 +1,65 @@
+name: Patch 19 validation and release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust MSVC
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+      - name: Locked debug build
+        shell: pwsh
+        run: |
+          cmd /c 'cargo build --workspace --locked > patch19-build.log 2>&1'
+          $code = $LASTEXITCODE
+          Get-Content patch19-build.log
+          exit $code
+      - name: Locked tests (no hardware GPU)
+        shell: pwsh
+        run: |
+          # The same end-to-end exclusion as ci.yml, no new skips.
+          cmd /c 'cargo test --workspace --locked -- --test-threads=4 --skip test_title_runs_and_game_folder_is_untouched > patch19-tests.log 2>&1'
+          $code = $LASTEXITCODE
+          Get-Content patch19-tests.log
+          exit $code
+      - name: Locked release build
+        shell: pwsh
+        run: |
+          cmd /c 'cargo build --release --workspace --locked > patch19-release.log 2>&1'
+          $code = $LASTEXITCODE
+          Get-Content patch19-release.log
+          if ($code -ne 0) { exit $code }
+          if (-not (Test-Path target/release/xcl.exe)) { throw 'Expected release executable is missing' }
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCL-Patch19-logs
+          path: patch19-*.log
+          if-no-files-found: warn
+      - name: Upload release
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: XCL-Patch19-Windows
+          path: |
+            target/release/xcl.exe
+            target/release/xcl.pdb
+          if-no-files-found: error

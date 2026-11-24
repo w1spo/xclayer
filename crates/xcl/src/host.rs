@@ -84,6 +84,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     (GlobalMemoryStatusEx(&mut m) != 0).then_some((m.ullAvailPhys >> 20, m.ullAvailPageFile >> 20, m.dwMemoryLoad))
                 };
                 crate::log::detail(format_args!("system_memory (available_phys_MiB, available_commit_MiB, load_percent)={system:?} private_MiB={:?}", private.map(|v| v >> 20)));
+                let (xmem, physical, plain) = crate::hle::kernelx::title_allocation_diagnostics();
+                crate::log::detail(format_args!("title_allocations xmem_default_live=(count,logical_bytes,incomplete):{xmem:?} physical_live_logical_bytes={physical:?} plain_virtual=(reservations,explicit_commit_bytes,untracked_ops):{plain:?} coverage=partial_not_total_commit"));
                 let video = crate::hle::d3d12x::real::video_memory();
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();

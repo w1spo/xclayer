@@ -38,10 +38,20 @@ fn install() {
 /// Commit `page` if it is a lazy one (true: it was).
 unsafe fn commit(page: usize) -> bool {
     let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+    commit_marked(&mut g, page, || !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null())
+}
+
+fn commit_marked(g: &mut BTreeSet<usize>, page: usize, allocate: impl FnOnce() -> bool) -> bool {
     if !g.remove(&page) {
         return false;
     }
-    !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+    if !allocate() {
+        // (no commit left: the page stays lazy, so a later access – or `ensure` – tries again
+        // instead of finding a mapped page that is neither lazy nor committed)
+        g.insert(page);
+        return false;
+    }
+    true
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -122,6 +132,18 @@ mod tests {
             assert!(crate::gpu::shader::readable(r + PAGE, 4));
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
         }
+    }
+
+    #[test]
+    fn failed_commit_keeps_the_lazy_page() {
+        // A fixed low address is not reserved by this process. Use a local set injection
+        // instead of exhausting the machine's real commit budget.
+        let page = PAGE;
+        let mut pages = BTreeSet::from([page]);
+        assert!(!commit_marked(&mut pages, page, || false));
+        assert!(pages.contains(&page));
+        assert!(commit_marked(&mut pages, page, || true));
+        assert!(!pages.contains(&page));
     }
 
     #[test]

@@ -134,7 +134,11 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
     {
         return fail();
     }
+    // A replacement can contain title physical mappings, even when its backing
+    // reservation stays alive because another placeholder still uses it.
+    let mut mappings = super::AWAY.lock().unwrap();
     if !r.placeholder {
+        if !super::unmap_pages_in(&mut mappings, base, r.end) { return Some(0); }
         super::super::d3d12x::sparse::decommitted(base, r.end - base);
         if mem::VirtualFree(addr, r.end - base, mem::MEM_DECOMMIT) == 0 {
             return Some(0);

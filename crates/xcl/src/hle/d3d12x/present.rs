@@ -69,6 +69,7 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
         return 0;
     }
     let token = (planes as *const u64).read_unaligned();
+    register_queue(queue);
     let _present = PRESENTX_LOCK.lock().unwrap();
     present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
@@ -259,8 +260,22 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
 static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// The queues the title submitted work to.
-pub fn known_queues() -> Vec<usize> {
-    QUEUES.lock().unwrap().clone()
+pub fn known_queues() -> Vec<ID3D12CommandQueue> {
+    let g = QUEUES.lock().unwrap();
+    g.iter().filter_map(|&raw| unsafe {
+        ID3D12CommandQueue::from_raw_borrowed(&(raw as *mut c_void)).cloned()
+    }).collect()
+}
+
+/// Register before submitting work, not afterwards: late-release snapshots must
+/// see any title queue already capable of referencing an enqueued resource.
+pub unsafe fn register_queue(queue: *mut c_void) {
+    if queue.is_null() { return; }
+    let mut q = QUEUES.lock().unwrap();
+    if !q.contains(&(queue as usize)) {
+        add_ref(queue as usize);
+        q.push(queue as usize);
+    }
 }
 
 static EXECUTES: AtomicU64 = AtomicU64::new(0);
@@ -272,13 +287,6 @@ pub fn activity() -> (u64, u64) {
 
 pub unsafe fn note_execute(queue: *mut c_void, lists: &[*mut c_void]) {
     EXECUTES.fetch_add(1, Ordering::Relaxed);
-    {
-        let mut q = QUEUES.lock().unwrap();
-        if !q.contains(&(queue as usize)) {
-            add_ref(queue as usize);
-            q.push(queue as usize);
-        }
-    }
     super::late_release::drain_known(false);
     if !enabled() || IN_PRESENT.with(|c| c.get()) || PRESENTX.load(Ordering::Relaxed) {
         return;

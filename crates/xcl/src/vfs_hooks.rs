@@ -5,7 +5,8 @@
 //! the game's own imports. A thread-local guard makes the hooks transparent for any
 //! file I/O the VFS itself performs.
 //!
-//! Known gap (documented in the report): direct `Nt*` file syscalls are not hooked.
+//! Title imports of NtReadFile/NtWriteFile also prepare lazy buffers; raw syscalls
+//! and other native file APIs remain unhandled. No native path redirection.
 
 use std::cell::Cell;
 use std::collections::HashSet;
@@ -484,6 +485,10 @@ static O_CREATE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_REMOVE_DIR_W: AtomicUsize = AtomicUsize::new(0);
 static O_DELETE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_READ_FILE: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE_EX: AtomicUsize = AtomicUsize::new(0);
+static O_READ_FILE_SCATTER: AtomicUsize = AtomicUsize::new(0);
+static O_WRITE_FILE: AtomicUsize = AtomicUsize::new(0);
+static O_WRITE_FILE_EX: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_EX_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_PROGRESS_W: AtomicUsize = AtomicUsize::new(0);
 static O_MOVE_FILE_A: AtomicUsize = AtomicUsize::new(0);
@@ -531,10 +536,98 @@ unsafe extern "system" fn hk_remove_dir_w(n: *const u16) -> i32 {
 unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32, read: *mut u32, ov: *mut c_void) -> i32 {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32, *mut c_void) -> i32;
     let orig = orig!(O_READ_FILE as F);
-    if !buf.is_null() {
-        crate::hle::kernelx::lazy::ensure(buf as usize, n as usize);
-    }
+    ensure_file_buffer(buf as usize, n as usize);
     orig(h, buf, n, read, ov)
+}
+
+/// ReadFileEx: like `ReadFile`, a buffer in pages the title mapped but has not used yet is
+/// committed first (the kernel's write there would fail with ERROR_NOACCESS).
+unsafe extern "system" fn hk_read_file_ex(h: *mut c_void, buf: *mut c_void, n: u32, ov: *mut c_void, routine: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, *mut c_void) -> i32;
+    let orig = orig!(O_READ_FILE_EX as F);
+    ensure_file_buffer(buf as usize, n as usize);
+    orig(h, buf, n, ov, routine)
+}
+
+// Kernel I/O reads and writes buffers without invoking the title's lazy-page handler.
+fn ensure_file_buffer(buf: usize, n: usize) {
+    if buf != 0 && n != 0 && buf.checked_add(n).is_some() {
+        let error = unsafe { GetLastError() };
+        crate::hle::kernelx::lazy::ensure(buf, n);
+        unsafe { SetLastError(error) };
+    }
+}
+
+// Native file calls made through a title import, not a process-wide ntdll hook.
+// The Windows x64 ABI for NtReadFile and NtWriteFile is identical.
+type NativeFileIo = unsafe extern "system" fn(HANDLE, HANDLE, *mut c_void, *mut c_void, *mut c_void, *mut c_void, u32, *const i64, *const u32) -> i32;
+static NT_READ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static NT_WRITE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn native_file_io_override(name: &crate::pe::ImportName, original: usize) -> Option<usize> {
+    let crate::pe::ImportName::Name { name, .. } = name else { return None };
+    let (slot, wrapper) = match name.as_str() {
+        "NtReadFile" => (&NT_READ, title_nt_read_file as NativeFileIo as usize),
+        "NtWriteFile" => (&NT_WRITE, title_nt_write_file as NativeFileIo as usize),
+        _ => return None,
+    };
+    (original != 0 && *slot.get_or_init(|| original) == original).then_some(wrapper)
+}
+
+unsafe fn call_native_file_io(f: NativeFileIo, h: HANDLE, event: HANDLE, apc: *mut c_void, ctx: *mut c_void, iosb: *mut c_void, buf: *mut c_void, n: u32, offset: *const i64, key: *const u32) -> i32 {
+    ensure_file_buffer(buf as usize, n as usize);
+    ensure_file_buffer(iosb as usize, 16); // IO_STATUS_BLOCK, x64
+    ensure_file_buffer(offset as usize, 8);
+    ensure_file_buffer(key as usize, 4);
+    f(h, event, apc, ctx, iosb, buf, n, offset, key)
+}
+
+unsafe extern "system" fn title_nt_read_file(h: HANDLE, event: HANDLE, apc: *mut c_void, ctx: *mut c_void, iosb: *mut c_void, buf: *mut c_void, n: u32, offset: *const i64, key: *const u32) -> i32 {
+    let Some(&f) = NT_READ.get() else { return 0xC0000002u32 as i32 };
+    call_native_file_io(std::mem::transmute::<usize, NativeFileIo>(f), h, event, apc, ctx, iosb, buf, n, offset, key)
+}
+
+unsafe extern "system" fn title_nt_write_file(h: HANDLE, event: HANDLE, apc: *mut c_void, ctx: *mut c_void, iosb: *mut c_void, buf: *mut c_void, n: u32, offset: *const i64, key: *const u32) -> i32 {
+    let Some(&f) = NT_WRITE.get() else { return 0xC0000002u32 as i32 };
+    call_native_file_io(std::mem::transmute::<usize, NativeFileIo>(f), h, event, apc, ctx, iosb, buf, n, offset, key)
+}
+
+unsafe extern "system" fn hk_write_file(h: *mut c_void, buf: *const c_void, n: u32, written: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut u32, *mut c_void) -> i32;
+    ensure_file_buffer(buf as usize, n as usize);
+    orig!(O_WRITE_FILE as F)(h, buf, n, written, ov)
+}
+
+unsafe extern "system" fn hk_write_file_ex(h: *mut c_void, buf: *const c_void, n: u32, ov: *mut c_void, routine: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const c_void, u32, *mut c_void, *mut c_void) -> i32;
+    ensure_file_buffer(buf as usize, n as usize);
+    orig!(O_WRITE_FILE_EX as F)(h, buf, n, ov, routine)
+}
+
+/// FILE_SEGMENT_ELEMENT is a 64-bit union on the supported x64 host; one entry per
+/// system page (not per console 64 KiB page). Leave malformed requests to Win32.
+unsafe fn ensure_scatter(segments: *const u64, n: usize, page: usize) {
+    if segments.is_null() || page == 0 || n == 0 || !n.is_multiple_of(page) { return; }
+    let count = n / page;
+    let Some(bytes) = count.checked_mul(std::mem::size_of::<u64>()) else { return };
+    ensure_file_buffer(segments as usize, bytes);
+    if !crate::gpu::shader::readable(segments as usize, bytes) { return; }
+    for i in 0..count {
+        let at = segments.add(i).read_unaligned() as usize;
+        if at != 0 && at.is_multiple_of(page) {
+            ensure_file_buffer(at, page);
+        }
+    }
+}
+
+unsafe extern "system" fn hk_read_file_scatter(h: *mut c_void, segments: *const u64, n: u32, reserved: *mut u32, ov: *mut c_void) -> i32 {
+    type F = unsafe extern "system" fn(*mut c_void, *const u64, u32, *mut u32, *mut c_void) -> i32;
+    let error = GetLastError();
+    let mut info: windows_sys::Win32::System::SystemInformation::SYSTEM_INFO = std::mem::zeroed();
+    windows_sys::Win32::System::SystemInformation::GetSystemInfo(&mut info);
+    ensure_scatter(segments, n as usize, info.dwPageSize as usize);
+    SetLastError(error);
+    orig!(O_READ_FILE_SCATTER as F)(h, segments, n, reserved, ov)
 }
 
 unsafe extern "system" fn hk_delete_file_w(n: *const u16) -> i32 {
@@ -957,7 +1050,7 @@ struct MergedFind {
 static MERGED: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
 
 fn is_merged(h: HANDLE) -> bool {
-    MERGED.lock().ok().and_then(|g| g.as_ref().map(|s| s.contains(&(h as usize)))).unwrap_or(false)
+    MERGED.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(h as usize)))
 }
 
 fn name_of(d: &WIN32_FIND_DATAW) -> String {
@@ -1167,9 +1260,9 @@ unsafe extern "system" fn hk_find_next_a(h: HANDLE, data: *mut WIN32_FIND_DATAA)
 unsafe extern "system" fn hk_find_close(h: HANDLE) -> i32 {
     let was = MERGED
         .lock()
-        .ok()
-        .and_then(|mut g| g.as_mut().map(|s| s.remove(&(h as usize))))
-        .unwrap_or(false);
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .is_some_and(|s| s.remove(&(h as usize)));
     if was {
         drop(Box::from_raw(h as *mut MergedFind));
         return 1;
@@ -1198,6 +1291,10 @@ pub fn install() -> Result<(), String> {
         ("RemoveDirectoryW", hk_remove_dir_w as usize, &O_REMOVE_DIR_W),
         ("DeleteFileW", hk_delete_file_w as usize, &O_DELETE_FILE_W),
         ("ReadFile", hk_read_file as usize, &O_READ_FILE),
+        ("ReadFileEx", hk_read_file_ex as usize, &O_READ_FILE_EX),
+        ("ReadFileScatter", hk_read_file_scatter as usize, &O_READ_FILE_SCATTER),
+        ("WriteFile", hk_write_file as usize, &O_WRITE_FILE),
+        ("WriteFileEx", hk_write_file_ex as usize, &O_WRITE_FILE_EX),
         ("MoveFileExW", hk_move_file_ex_w as usize, &O_MOVE_FILE_EX_W),
         ("MoveFileWithProgressW", hk_move_file_with_progress_w as usize, &O_MOVE_FILE_PROGRESS_W),
         ("CopyFileExW", hk_copy_file_ex_w as usize, &O_COPY_FILE_EX_W),
@@ -1243,6 +1340,55 @@ mod tests {
         CopyFile2, CopyFileExW, CopyFileW, CreateFileW, MoveFileExW, COPYFILE2_EXTENDED_PARAMETERS,
         CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
     };
+
+    #[test]
+    fn file_buffers_and_scatter_segments_commit_lazy_pages_before_io() {
+        use windows_sys::Win32::System::Memory as mem;
+        const PAGE: usize = 0x1_0000;
+        unsafe {
+            let base = mem::VirtualAlloc(std::ptr::null(), 3 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            for i in 0..3 { crate::hle::kernelx::lazy::mark(base + i * PAGE); }
+            ensure_file_buffer(base, 16);
+            assert!(crate::gpu::shader::readable(base, 16));
+            let segments = [(base + PAGE) as u64, (base + 2 * PAGE) as u64];
+            ensure_scatter(segments.as_ptr(), 8192, 4096);
+            assert!(crate::gpu::shader::readable(base + PAGE, 4096));
+            assert!(crate::gpu::shader::readable(base + 2 * PAGE, 4096));
+            assert_ne!(mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn native_file_io_commits_buffers_and_forwards_status() {
+        use windows_sys::Win32::System::Memory as mem;
+        const PAGE: usize = 0x1_0000;
+        unsafe extern "system" fn fake(_h: HANDLE, _e: HANDLE, _a: *mut c_void, _c: *mut c_void, iosb: *mut c_void, buf: *mut c_void, n: u32, off: *const i64, key: *const u32) -> i32 {
+            // No assertions inside the extern function: signal any failure to the test.
+            let error = GetLastError();
+            if error == 123 && n == 16 && crate::gpu::shader::readable(buf as usize, 16)
+                && crate::gpu::shader::readable(iosb as usize, 16)
+                && crate::gpu::shader::readable(off as usize, 8)
+                && crate::gpu::shader::readable(key as usize, 4) {
+                SetLastError(456);
+                0x103 // STATUS_PENDING: preserve the actual NTSTATUS
+            } else { -1 }
+        }
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 4 * PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            for i in 0..4 { crate::hle::kernelx::lazy::mark(r + i * PAGE); }
+            let z = std::ptr::null_mut();
+            SetLastError(123);
+            let status = call_native_file_io(fake, z, z, z, z, (r + PAGE) as _, r as _, 16, (r + 2 * PAGE) as _, (r + 3 * PAGE) as _);
+            let error = GetLastError();
+            // Clean up all marked pages even on failure, before assertions.
+            crate::hle::kernelx::lazy::ensure(r, 4 * PAGE);
+            assert_ne!(mem::VirtualFree(r as _, 0, mem::MEM_RELEASE), 0);
+            assert_eq!(status, 0x103);
+            assert_eq!(error, 456);
+        }
+    }
 
     struct HookFixture {
         dir: PathBuf,

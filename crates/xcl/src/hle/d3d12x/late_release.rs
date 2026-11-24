@@ -34,6 +34,7 @@ struct Held {
     open: Vec<usize>,
     sealed: VecDeque<Batch>,
     last_seal: Option<Instant>,
+    seal_generation: u64,
 }
 
 // (the interface pointers are only used under the lock)
@@ -44,10 +45,25 @@ impl Held {
         self.open.is_empty() && self.sealed.is_empty()
     }
 
+    /// Only the first release in a backlog needs a synchronous drain attempt.
+    fn enqueue(&mut self, res: usize) -> bool {
+        let idle = self.is_empty();
+        self.open.push(res);
+        idle
+    }
+
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
+    #[cfg(test)]
     unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
-        if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
+        self.drain_cohort(queues, seal_now, self.seal_generation, self.open.len())
+    }
+
+    /// Only the prefix that existed before the queue snapshot may be sealed with it.
+    /// Another drain that already sealed that prefix invalidates this snapshot.
+    unsafe fn drain_cohort(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool, generation: u64, count: usize) -> Vec<usize> {
+        if generation == self.seal_generation && count != 0 && count <= self.open.len()
+            && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
             for q in queues {
@@ -72,7 +88,8 @@ impl Held {
             // (no fence or no signal: the device is gone – the batch stays open, and held)
             if ok {
                 self.last_seal = Some(Instant::now());
-                let dead = std::mem::take(&mut self.open);
+                self.seal_generation = self.seal_generation.wrapping_add(1);
+                let dead = self.open.drain(..count).collect();
                 self.sealed.push_back(Batch { dead, marks });
             }
         }
@@ -92,20 +109,13 @@ pub fn enabled() -> bool {
     *ON.get_or_init(|| !std::env::var("XCL_LATE_RELEASE").is_ok_and(|v| v.trim() == "0"))
 }
 
-/// how long a last `Release` itself waits for queues with nothing to do to say so
-const IDLE_WAIT: Duration = Duration::from_micros(300);
-
-/// `res` (an adopted resource) holds one reference that is now this module's. With no work in
-/// flight it goes before this returns (the queues pass a fence value at once): a title that
-/// frees the memory under a resource right after its last `Release` finds it unpinned, as
-/// before. Otherwise the thread here lets it go.
+/// `res` (an adopted resource) holds one reference that is now this module's.
+/// Try to release an idle batch immediately. With work outstanding, accumulate releases
+/// for the worker's next seal instead of spinning or cloning the queue list per release.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
-    let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
-        drain_known(false);
+    let idle = HELD.lock().unwrap().get_or_insert_with(Held::default).enqueue(res);
+    if idle {
+        drain_known(true);
     }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
         return;
@@ -134,21 +144,17 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
-    }
-    let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
-    for raw in super::present::known_queues() {
-        let raw = raw as *mut c_void;
-        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&raw) {
-            queues.push(q.clone());
-        }
-    }
+    let (generation, count) = {
+        let g = HELD.lock().unwrap();
+        let Some(h) = g.as_ref().filter(|h| !h.is_empty()) else { return };
+        (h.seal_generation, h.open.len())
+    };
+    let mut queues = super::present::known_queues();
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
     queues.extend(super::vram::mapping_queues());
     let gone = match HELD.lock().unwrap().as_mut() {
-        Some(h) => h.drain(&queues, seal_now),
+        Some(h) => h.drain_cohort(&queues, seal_now, generation, count),
         None => return,
     };
     // (outside the lock: a release may end other objects, whose releases come back here)
@@ -211,6 +217,29 @@ mod tests {
             assert!(held.is_empty());
             drop(ID3D12Resource::from_raw(raw as *mut c_void));
         }
+    }
+
+    #[test]
+    fn only_the_first_release_in_a_backlog_requests_an_immediate_seal() {
+        let mut held = Held::default();
+        assert!(held.enqueue(1));
+        assert!(!held.enqueue(2));
+        assert!(!held.enqueue(3));
+        assert_eq!(unsafe { held.drain(&[], true) }, vec![1, 2, 3]);
+        assert!(held.enqueue(4));
+    }
+
+    #[test]
+    fn queue_snapshot_only_seals_its_original_cohort() {
+        let mut h = Held::default();
+        h.enqueue(1);
+        let generation = h.seal_generation;
+        let count = h.open.len();
+        h.enqueue(2);
+        assert_eq!(unsafe { h.drain_cohort(&[], true, generation, count) }, vec![1]);
+        assert!(unsafe { h.drain_cohort(&[], true, generation, count) }.is_empty());
+        assert_eq!(h.open, vec![2]);
+        assert_eq!(unsafe { h.drain(&[], true) }, vec![2]);
     }
 
     /// With no queue at all nothing can be in flight: the next drain lets the batch go.
