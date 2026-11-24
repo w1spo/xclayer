@@ -671,11 +671,68 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
     (k < s.array as usize).then_some((s, at, i, k))
 }
 
+/// Compute the addressed linear span without permitting overlapping rows or depth slices.
+fn pitched_span(row: usize, height: usize, depth: usize, row_pitch: usize, slice_pitch: usize) -> Option<usize> {
+    if row == 0 || height == 0 || depth == 0 || row_pitch < row {
+        return None;
+    }
+    let slice = (height - 1).checked_mul(row_pitch)?.checked_add(row)?;
+    if depth > 1 && slice_pitch < slice {
+        return None;
+    }
+    let span = (depth - 1).checked_mul(slice_pitch)?.checked_add(slice)?;
+    (span <= isize::MAX as usize).then_some(span)
+}
+
+/// Check every region touched by the copy, rejecting guard and inaccessible pages.
+/// As with the caller's COM lifetime contract, the caller must keep these mappings stable
+/// until the operation returns; VirtualQuery is a preflight, not a page pin.
+fn copy_span_access(at: usize, len: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    if at == 0 || len == 0 || len > isize::MAX as usize {
+        return false;
+    }
+    let Some(end) = at.checked_add(len) else { return false };
+    let mut cur = at;
+    while cur < end {
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(cur as *const c_void, &mut info, std::mem::size_of_val(&info)) } == 0
+            || info.State != MEM_COMMIT || info.Protect & 0x100 != 0 {
+            return false;
+        }
+        let access = info.Protect & 0xff;
+        if !(if write { matches!(access, 0x04 | 0x08 | 0x40 | 0x80) }
+            else { matches!(access, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80) }) {
+            return false;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else { return false };
+        if next <= cur { return false; }
+        cur = next;
+    }
+    true
+}
+
+fn tiled_span(t: &Surface, at: u64, k: usize) -> Option<(usize, usize)> {
+    let at = usize::try_from(at).ok()?;
+    if t.depth > 0 {
+        Some((at, usize::try_from(t.size()).ok()?))
+    } else {
+        Some((at.checked_add(k.checked_mul(t.chain.slice_bytes)?)?, t.chain.slice_bytes))
+    }
+}
+
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
 unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
-    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
+    let Some((t, at, i, k)) = (!p.is_null() && !dst.is_null() && !src.is_null()).then(|| subresource(tex(p), plane, sub)).flatten() else { return E_INVALIDARG };
     let m = t.chain.levels[i];
-    let row = m.width * t.bpe as usize;
+    let Some(row) = m.width.checked_mul(t.bpe as usize) else { return E_INVALIDARG };
+    let depth = if t.depth > 0 { m.depth } else { 1 };
+    let Some(linear_len) = pitched_span(row, m.height, depth, row_pitch as usize, slice_pitch as usize) else { return E_INVALIDARG };
+    let Some((offset, tiled_len)) = tiled_span(t, at, k) else { return E_INVALIDARG };
+    let Some(tiled_addr) = (dst as usize).checked_add(offset) else { return E_INVALIDARG };
+    if !copy_span_access(src as usize, linear_len, false) || !copy_span_access(tiled_addr, tiled_len, true) {
+        return E_INVALIDARG;
+    }
     if t.depth > 0 {
         let mut linear = vec![0u8; row * m.height * m.depth];
         for (n, to) in linear.chunks_exact_mut(row).enumerate() {
@@ -696,9 +753,16 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
 unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
-    let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
+    let Some((t, at, i, k)) = (!p.is_null() && !dst.is_null() && !src.is_null()).then(|| subresource(tex(p), plane, sub)).flatten() else { return E_INVALIDARG };
     let m = t.chain.levels[i];
-    let row = m.width * t.bpe as usize;
+    let Some(row) = m.width.checked_mul(t.bpe as usize) else { return E_INVALIDARG };
+    let depth = if t.depth > 0 { m.depth } else { 1 };
+    let Some(linear_len) = pitched_span(row, m.height, depth, row_pitch as usize, slice_pitch as usize) else { return E_INVALIDARG };
+    let Some((offset, tiled_len)) = tiled_span(t, at, k) else { return E_INVALIDARG };
+    let Some(tiled_addr) = (src as usize).checked_add(offset) else { return E_INVALIDARG };
+    if !copy_span_access(dst as usize, linear_len, true) || !copy_span_access(tiled_addr, tiled_len, false) {
+        return E_INVALIDARG;
+    }
     if t.depth > 0 {
         let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
         for (n, from) in linear.chunks_exact(row).enumerate() {
@@ -718,6 +782,16 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pitched_span_rejects_overlap_and_overflow() {
+        assert_eq!(pitched_span(16, 3, 1, 32, 0), Some(80));
+        assert_eq!(pitched_span(16, 3, 2, 32, 80), Some(160));
+        assert_eq!(pitched_span(16, 3, 2, 15, 80), None);
+        assert_eq!(pitched_span(16, 3, 2, 32, 79), None);
+        assert_eq!(pitched_span(16, 3, 2, usize::MAX, 80), None);
+        assert_eq!(pitched_span(0, 3, 2, 32, 80), None);
+    }
 
     fn desc(width: u64, height: u32, array: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];

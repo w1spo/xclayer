@@ -273,6 +273,7 @@ impl Table {
                 if e.unmapped {
                     e.unmapped = false;
                     to_remap.push(sres);
+                    invalidate_upload(sres);
                     if !e.gpu_written {
                         e.pending = true;
                         e.retries = 0;
@@ -455,17 +456,30 @@ fn recheck_gpu_view_sources() {
     // (the shadowed textures too: one comes back when the texture over it goes)
     let mut g = TEXTURES.lock().unwrap();
     let t = &mut *g;
-    for e in t.by_res.values_mut() {
+    for (&res, e) in t.by_res.iter_mut() {
         let was_pending = e.pending;
         changed |= recheck_source(e);
+        // A new GPU view generation may change backing while retaining its address.
+        if e.in_gpu_view && !e.gpu_written {
+            invalidate_upload(res);
+            e.pending = true;
+            e.retries = 0;
+            changed = true;
+        }
         if !was_pending && e.pending {
             adjust_pending(1);
         }
     }
     // Shadowed entries are not counted by PENDING until Table::remove restores
     // them to the active table. Their source can still change while dormant.
-    for e in t.shadowed.values_mut() {
+    for (&res, e) in t.shadowed.iter_mut() {
         changed |= recheck_source(e);
+        if e.in_gpu_view && !e.gpu_written {
+            invalidate_upload(res);
+            e.pending = true;
+            e.retries = 0;
+            changed = true;
+        }
     }
     drop(g);
     if changed {
@@ -917,9 +931,12 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
+            // Own the bytes used for both the hash and detiling, rather than rereading
+            // title memory after deciding whether to upload.
+            let snapshot = read_committed(va, tex.size() as usize);
             let mut hash = None;
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                let h = content_hash(&snapshot);
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -934,14 +951,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             hashes.push((hash, seq, va));
             device = dev;
             bytes += tex.size() as usize;
-            picked.push((r, va, tex, states));
+            picked.push((r, va, tex, states, snapshot));
         }
         if picked.is_empty() {
             continue;
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        for ((r, va, _, states, _), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
             }
@@ -1198,7 +1215,7 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
     // walking it)
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        copy_committed_region(at, out.as_mut_ptr(), len);
         return out;
     }
     let mut p = at;
@@ -1226,8 +1243,8 @@ const PARALLEL_BYTES: usize = 1 << 20;
 /// `subresources` of every texture of a batch (`bytes` of them), in order: on several threads
 /// when the batch is big. They were read and detiled one after another in the title's own
 /// submit – most of a retail game's render thread while it streamed textures the CPU writes.
-unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>)], bytes: usize) -> Vec<Vec<Subresource>> {
-    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, va, tex, _)| (*va, &**tex)).collect();
+unsafe fn subresources_of_all(picked: &[(ID3D12Resource, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, Vec<u8>)], bytes: usize) -> Vec<Vec<Subresource>> {
+    let picked: Vec<(usize, &xg::Texture)> = picked.iter().map(|(_, _, tex, _, snapshot)| (snapshot.as_ptr() as usize, &**tex)).collect();
     let threads = if bytes < PARALLEL_BYTES { 1 } else { std::thread::available_parallelism().map_or(1, |n| n.get() / 2).clamp(1, 8) };
     subresources_on(&picked, threads)
 }
