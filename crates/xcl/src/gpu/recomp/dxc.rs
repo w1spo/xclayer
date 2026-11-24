@@ -640,16 +640,32 @@ pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> R
 
 type CacheFlight = (PathBuf, u64);
 
-fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
-    static FLIGHTS: OnceLock<Mutex<HashMap<CacheFlight, Weak<Mutex<()>>>>> = OnceLock::new();
-    let mut flights = FLIGHTS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
-    flights.retain(|_, v| v.strong_count() != 0);
-    if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
-        return flight;
+#[derive(Default)]
+struct CacheFlights {
+    entries: HashMap<CacheFlight, Weak<Mutex<()>>>,
+    next_sweep: usize,
+}
+
+impl CacheFlights {
+    fn get(&mut self, key: CacheFlight) -> Arc<Mutex<()>> {
+        if let Some(flight) = self.entries.get(&key).and_then(Weak::upgrade) {
+            return flight;
+        }
+        // A full registry scan under the global lock on every new shader is
+        // unnecessary. Sweep only when the map reaches a growing threshold.
+        if self.entries.len() >= self.next_sweep.max(64) {
+            self.entries.retain(|_, v| v.strong_count() != 0);
+            self.next_sweep = self.entries.len().saturating_mul(2).max(64);
+        }
+        let flight = Arc::new(Mutex::new(()));
+        self.entries.insert(key, Arc::downgrade(&flight));
+        flight
     }
-    let flight = Arc::new(Mutex::new(()));
-    flights.insert(key, Arc::downgrade(&flight));
-    flight
+}
+
+fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
+    static FLIGHTS: OnceLock<Mutex<CacheFlights>> = OnceLock::new();
+    FLIGHTS.get_or_init(|| Mutex::new(CacheFlights::default())).lock().unwrap().get(key)
 }
 
 struct ProcessCacheLock {
@@ -912,6 +928,22 @@ mod cache_tests {
         b[52..56].copy_from_slice(b"DXIL"); // inner DxilBitcodeHeader magic
         b[67] = marker;
         b
+    }
+
+    #[test]
+    fn flight_registry_amortizes_cleanup_without_losing_live_flights() {
+        let mut flights = CacheFlights::default();
+        let key = |n| (PathBuf::from("cache"), n);
+        let live = flights.get(key(0));
+        for n in 1..64 { drop(flights.get(key(n))); }
+        assert_eq!(flights.entries.len(), 64, "no full sweep on every miss");
+        let another = flights.get(key(64));
+        assert_eq!(flights.entries.len(), 2);
+        assert!(Arc::ptr_eq(&live, &flights.get(key(0))));
+        assert!(Arc::ptr_eq(&another, &flights.get(key(64))));
+        for n in 65..1000 { drop(flights.get(key(n))); }
+        assert!(flights.entries.len() <= 64);
+        assert!(Arc::ptr_eq(&live, &flights.get(key(0))));
     }
 
     #[test]

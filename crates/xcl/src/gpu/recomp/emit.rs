@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use super::{elements_at, param_registers, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, vs_param_register, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
+use super::{elements_at_ranked, registers_ranked, ps_attribute_slot, ps_input_vgpr, ps_slot_attribute, ranked, Mode, MsInterface, Options, KERNEL_EXPORTS, KERNEL_LANES, KERNEL_SCC_SLOT, KERNEL_SGPRS, KERNEL_SPLIT_MAGIC, KERNEL_SPLIT_SGPRS, KERNEL_VGPRS, MESH_HEADER};
 use super::upper_lanes::Read;
 use crate::gpu::dxbc::SigElement;
 use crate::gpu::rdna2::{self, Decoded, Encoding, Operand, Variant};
@@ -1898,7 +1898,11 @@ impl Em {
                 // param N is a register: channel c goes to component c of every element there
                 let k = (tgt - 32) as usize;
                 let params = ranked(&vs.outputs, true);
-                let at = vs_param_register(vs, k).map(|r| elements_at(&vs.outputs, true, r)).unwrap_or_default();
+                let reg = match &vs.params {
+                    Some(t) => t.get(k).copied(),
+                    None => registers_ranked(&params).get(k).copied(),
+                };
+                let at = reg.map(|r| elements_at_ranked(&params, r)).unwrap_or_default();
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
@@ -1958,7 +1962,8 @@ impl Em {
                 // param N is a register: its record slot is that of every element there (the
                 // pass-through reads an element's slot as the whole register, as for the GS)
                 let k = (tgt - 32) as usize;
-                let at = param_registers(&ms.outputs, true).get(k).map(|&r| elements_at(&ms.outputs, true, r)).unwrap_or_default();
+                let params = ranked(&ms.outputs, true);
+                let at = registers_ranked(&params).get(k).map(|&r| elements_at_ranked(&params, r)).unwrap_or_default();
                 if at.is_empty() {
                     self.line("/* param without an OSG1 element (dummy) */");
                     return Ok(());
@@ -4838,8 +4843,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
         let _ = writeln!(fill, "        o.p{k} = {v};");
     }
     let tri_base = MESH_HEADER + mv as usize * vd;
-    let split = passthrough_split(ms, elems.len());
-    if split == 1 {
+    let primitives_per_group = passthrough_primitives_per_group(ms, elems.len());
+    if primitives_per_group.is_none() {
         let _ = writeln!(
             h,
             "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
@@ -4860,7 +4865,8 @@ pub fn mesh_passthrough_for(ms: &MsInterface, ps_inputs: Option<&[SigElement]>) 
     }
     // over the mesh output limit: `split` mesh groups per record, each a run of its
     // triangles with their own copies of the three vertices
-    let ppg = mp.div_ceil(split);
+    let ppg = primitives_per_group.unwrap();
+    let split = mp.max(1).div_ceil(ppg);
     let _ = writeln!(
         h,
         "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{}], out indices uint3 tris[{ppg}])\n{{",
@@ -4889,12 +4895,20 @@ const MESH_OUTPUT_BYTES: u32 = 32768;
 /// mesh output limit as they are, else the triangles are split into runs whose own vertex
 /// copies (3 per triangle) fit. `elements`: output elements besides SV_Position.
 pub fn passthrough_split(ms: &MsInterface, elements: usize) -> u32 {
-    let vbytes = 16 * (1 + elements as u32);
-    if vbytes * ms.max_vertices <= MESH_OUTPUT_BYTES {
-        return 1;
+    passthrough_primitives_per_group(ms, elements)
+        .map_or(1, |ppg| ms.max_primitives.max(1).div_ceil(ppg))
+}
+
+/// D3D12 rounds the declared vertex count up to a multiple of 32 for its output
+/// memory limit. An expanded group can still fit in one dispatch group.
+fn passthrough_primitives_per_group(ms: &MsInterface, elements: usize) -> Option<u32> {
+    let vertex_bytes = 16 * (1 + elements as u32);
+    let max_vertices = (MESH_OUTPUT_BYTES / vertex_bytes).min(256) / 32 * 32;
+    if ms.max_vertices <= max_vertices {
+        return None;
     }
-    let ppg = (MESH_OUTPUT_BYTES / (3 * vbytes)).max(1);
-    ms.max_primitives.max(1).div_ceil(ppg)
+    let groups = ms.max_primitives.max(1).div_ceil((max_vertices / 3).max(1));
+    Some(ms.max_primitives.max(1).div_ceil(groups))
 }
 
 /// Output elements (besides SV_Position) of `mesh_passthrough_for` for these inputs.

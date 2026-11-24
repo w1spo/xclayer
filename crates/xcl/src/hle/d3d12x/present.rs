@@ -259,6 +259,11 @@ unsafe fn backbuffer_like(res: usize) -> Option<D3D12_RESOURCE_DESC> {
 /// queues the title submitted work to (AddRef'd: they stay valid for `drain`)
 static QUEUES: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
+/// Best-effort count of retained title queue references.
+pub fn queue_count() -> Option<usize> {
+    QUEUES.try_lock().ok().map(|g| g.len())
+}
+
 /// The queues the title submitted work to.
 pub fn known_queues() -> Vec<ID3D12CommandQueue> {
     let g = QUEUES.lock().unwrap();

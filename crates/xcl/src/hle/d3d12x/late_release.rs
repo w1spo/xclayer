@@ -10,7 +10,7 @@
 //! signalled on every queue with work on it; the batch goes once all of them have passed it.
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -50,6 +50,13 @@ impl Held {
         let idle = self.is_empty();
         self.open.push(res);
         idle
+    }
+
+    /// A queue snapshot is needed only when a new batch can be sealed. Polling
+    /// completed batches uses their owning fence references, not the queue registry.
+    fn seal_request(&self, seal_now: bool) -> Option<(u64, usize)> {
+        (!self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)))
+            .then_some((self.seal_generation, self.open.len()))
     }
 
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
@@ -102,6 +109,21 @@ impl Held {
 }
 
 static HELD: Mutex<Option<Held>> = Mutex::new(None);
+static BACKLOG: Condvar = Condvar::new();
+
+fn wait_for_backlog(held: &Mutex<Option<Held>>, ready: &Condvar) {
+    let mut g = held.lock().unwrap();
+    while g.as_ref().is_none_or(Held::is_empty) {
+        g = ready.wait(g).unwrap();
+    }
+}
+
+/// (open resources, sealed resources, sealed batches, cached queue fences).
+pub(super) fn diagnostic_counts() -> Option<(usize, usize, usize, usize)> {
+    HELD.try_lock().ok().map(|g| g.as_ref().map_or((0, 0, 0, 0), |h| {
+        (h.open.len(), h.sealed.iter().map(|b| b.dead.len()).sum(), h.sealed.len(), h.fences.len())
+    }))
+}
 
 /// Whether last releases are held (`XCL_LATE_RELEASE=0` turns it off).
 pub fn enabled() -> bool {
@@ -115,6 +137,7 @@ pub fn enabled() -> bool {
 pub unsafe fn hold(res: usize) {
     let idle = HELD.lock().unwrap().get_or_insert_with(Held::default).enqueue(res);
     if idle {
+        BACKLOG.notify_one();
         drain_known(true);
     }
     if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
@@ -128,6 +151,10 @@ pub unsafe fn hold(res: usize) {
     static WARNED: AtomicBool = AtomicBool::new(false);
     if STARTED.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
         if let Err(e) = std::thread::Builder::new().name("xcl-late-release".into()).spawn(|| loop {
+            // No periodic polling while every held resource has been retired.
+            // enqueue() and the predicate use the same mutex, so a notification
+            // that arrives before wait() is not lost.
+            wait_for_backlog(&HELD, &BACKLOG);
             std::thread::sleep(TICK);
             unsafe { drain_known(false) };
         }) {
@@ -144,15 +171,19 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    let (generation, count) = {
+    let request = {
         let g = HELD.lock().unwrap();
         let Some(h) = g.as_ref().filter(|h| !h.is_empty()) else { return };
-        (h.seal_generation, h.open.len())
+        h.seal_request(seal_now)
     };
-    let mut queues = super::present::known_queues();
-    queues.extend(super::sparse::queue());
-    queues.extend(super::title_textures::upload_queues());
-    queues.extend(super::vram::mapping_queues());
+    let (generation, count) = request.unwrap_or((0, 0));
+    let mut queues = Vec::new();
+    if request.is_some() {
+        queues.extend(super::present::known_queues());
+        queues.extend(super::sparse::queue());
+        queues.extend(super::title_textures::upload_queues());
+        queues.extend(super::vram::mapping_queues());
+    }
     let gone = match HELD.lock().unwrap().as_mut() {
         Some(h) => h.drain_cohort(&queues, seal_now, generation, count),
         None => return,
@@ -220,6 +251,29 @@ mod tests {
     }
 
     #[test]
+    fn idle_release_worker_waits_for_a_backlog() {
+        let pair = std::sync::Arc::new((Mutex::new(None), Condvar::new()));
+        let worker_pair = pair.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (started, entering) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            wait_for_backlog(&worker_pair.0, &worker_pair.1);
+            tx.send(()).unwrap();
+        });
+        entering.recv().unwrap();
+        let idle = rx.recv_timeout(Duration::from_millis(30));
+        pair.0.lock().unwrap().get_or_insert_with(Held::default).enqueue(1);
+        pair.1.notify_one();
+        let was_idle = matches!(&idle, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        let awake = if was_idle { rx.recv_timeout(Duration::from_secs(2)) } else { idle };
+        // Check the result before join so a lost wake cannot hang the test suite.
+        awake.unwrap();
+        worker.join().unwrap();
+        assert!(was_idle);
+    }
+
+    #[test]
     fn only_the_first_release_in_a_backlog_requests_an_immediate_seal() {
         let mut held = Held::default();
         assert!(held.enqueue(1));
@@ -240,6 +294,21 @@ mod tests {
         assert!(unsafe { h.drain_cohort(&[], true, generation, count) }.is_empty());
         assert_eq!(h.open, vec![2]);
         assert_eq!(unsafe { h.drain(&[], true) }, vec![2]);
+    }
+
+    #[test]
+    fn polling_sealed_batches_does_not_request_queue_snapshot() {
+        let mut held = Held::default();
+        held.sealed.push_back(Batch { dead: vec![1], marks: Vec::new() });
+        assert_eq!(held.seal_request(false), None);
+        assert_eq!(held.seal_request(true), None);
+        held.enqueue(2);
+        held.last_seal = Some(Instant::now());
+        assert_eq!(held.seal_request(true), Some((0, 1)));
+        // A poll with no snapshot must not seal releases added after the poll began.
+        assert_eq!(unsafe { held.drain_cohort(&[], true, 0, 0) }, vec![1]);
+        assert_eq!(held.open, vec![2]);
+        assert_eq!(unsafe { held.drain(&[], true) }, vec![2]);
     }
 
     /// With no queue at all nothing can be in flight: the next drain lets the batch go.

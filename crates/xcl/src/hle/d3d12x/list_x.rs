@@ -578,6 +578,8 @@ struct ListState {
     pending_waits: Vec<PendingWait>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
+    /// Temporary default buffer used for non-overlapping copies within one window.
+    copy_scratch: Option<(ID3D12Resource, u64)>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
     pred_buf: Option<ID3D12Resource>,
     /// True while `pred_buf` is in `D3D12_RESOURCE_STATE_PREDICATION` on this open recording.
@@ -769,6 +771,7 @@ pub(super) fn on_release(list: usize) {
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
     if let Some(old) = old {
+        retire_copy_scratch(old.copy_scratch);
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
@@ -784,7 +787,7 @@ pub(super) fn on_release(list: usize) {
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
     super::title_textures::list_reset(list);
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
+    let scratch = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)).and_then(|s| {
         s.occlusion = Occlusion::default();
         s.written_ranges.clear();
         s.clear_sparse_writes();
@@ -794,7 +797,9 @@ pub(super) fn clear_segment_state(list: usize) {
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-    }
+        s.copy_scratch.take()
+    });
+    retire_copy_scratch(scratch);
 }
 
 #[cfg(test)]
@@ -1968,7 +1973,8 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if size == 0 || !size.is_multiple_of(4) {
         return warn(&N, W, format_args!("size {size:#x} is not a non-zero multiple of 4"));
     }
-    let (Some((d, doff)), Some((s, soff))) = (real::uma_window_buffer(dst as usize, size as usize), real::uma_window_buffer(src as usize, size as usize)) else {
+    let window = |addr| real::uma_window_buffer(addr, size as usize).filter(|&(buffer, _)| buffer != 0);
+    let (Some((d, doff)), Some((s, soff))) = (window(dst as usize), window(src as usize)) else {
         note_gpu_write("CopyMemoryToMemoryX", dst as usize, size);
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) is not in unified memory"));
     };
@@ -1976,15 +1982,76 @@ pub(super) unsafe extern "system" fn copy_memory_x(this: *mut c_void, dst: u64, 
     if d == s && dst < src + size && src < dst + size {
         return warn(&N, W, format_args!("{src:#x} → {dst:#x} ({size:#x} bytes) overlap"));
     }
-    note_write(this as usize, dst, size);
     if d == s {
-        // one window: the buffer is the source and the destination (the ranges do not overlap)
-        as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
+        if !copy_within_window(this, d, doff, soff, size) {
+            return warn(&N, W, format_args!("could not allocate a temporary copy buffer"));
+        }
+        note_write(this as usize, dst, size);
         return;
     }
+    note_write(this as usize, dst, size);
     transition(this, s, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     as_copy_dest(this, d, || copy_buffer_region(this, d, doff, s, soff, size));
     transition(this, s, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+// Legacy barriers cannot put one buffer in COPY_SOURCE and COPY_DEST together.
+unsafe fn copy_within_window(list: *mut c_void, window: usize, dst: u64, src: u64, bytes: u64) -> bool {
+    const SCRATCH_BYTES: u64 = 8 << 20;
+    let key = list as usize;
+    let cached = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&key))
+        .and_then(|s| s.copy_scratch.as_ref()).map(|(r, n)| (r.as_raw() as usize, *n));
+    let (scratch, capacity) = if let Some(cached) = cached {
+        cached
+    } else {
+        let Some(dev) = device_of(list) else { return false };
+        let capacity = bytes.next_power_of_two().clamp(64 << 10, SCRATCH_BYTES);
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: capacity,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut resource: Option<ID3D12Resource> = None;
+        if dev.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+            D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut resource,
+        ).is_err() {
+            return false;
+        }
+        let Some(resource) = resource else { return false };
+        real::adopt(resource.as_raw(), real::Kind::Resource);
+        let raw = resource.as_raw() as usize;
+        LISTS.lock().unwrap().get_or_insert_with(HashMap::new)
+            .entry(key).or_default().copy_scratch = Some((resource, capacity));
+        (raw, capacity)
+    };
+
+    let mut offset = 0;
+    while offset < bytes {
+        let size = (bytes - offset).min(capacity);
+        transition(list, window, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        transition(list, scratch, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        copy_buffer_region(list, scratch, 0, window, src + offset, size);
+        transition(list, window, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
+        transition(list, scratch, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        copy_buffer_region(list, window, dst + offset, scratch, 0, size);
+        transition(list, scratch, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        transition(list, window, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        offset += size;
+    }
+    true
+}
+
+fn retire_copy_scratch(scratch: Option<(ID3D12Resource, u64)>) {
+    if let Some((resource, _)) = scratch {
+        // The recording may have run, even when the title has now reset the list.
+        unsafe { super::late_release::hold(resource.into_raw() as usize) };
+    }
 }
 
 unsafe fn device_of(list: *mut c_void) -> Option<ID3D12Device> {
@@ -2611,15 +2678,16 @@ pub(super) unsafe fn before_close(list: *mut c_void) {
     }
 }
 
-/// Clear active predication state when `ID3D12GraphicsCommandList::Reset` resets a recording.
+/// Clear recording-owned state after a successful native Reset.
 pub(super) fn on_pc_reset(list: *mut c_void) {
-    if !PREDICATION_USED.load(Ordering::Acquire) || list.is_null() {
-        return;
-    }
-    if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
-        s.predication = None;
-        s.pred_in_state = false;
-    }
+    let scratch = LISTS.lock().unwrap().as_mut()
+        .and_then(|m| m.get_mut(&(list as usize)))
+        .and_then(|s| {
+            s.predication = None;
+            s.pred_in_state = false;
+            s.copy_scratch.take()
+        });
+    retire_copy_scratch(scratch);
 }
 
 /// Copy 8 predicate bytes from `(uma_buf, off)` into `pb` with exact barrier transitions and
@@ -2859,6 +2927,9 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    let scratch = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(target as usize)))
+        .and_then(|s| s.copy_scratch.take());
+    retire_copy_scratch(scratch);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3436,6 +3507,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
+    on_pc_reset(this);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -5203,12 +5275,15 @@ mod tests {
             cq.Signal(&fence, 2).unwrap();
             crate::gpu::fence::wait(&fence, 2, &dev, None, 2000).unwrap();
 
-            // 3. GPU readback of +0x100, +0x180, +0x200
+            // 3. Same-window D3D12.X copy and GPU readback of all four locations
             let da2: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
             let dl2: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &da2, None).unwrap();
+            real::adopt(dl2.as_raw(), real::Kind::CommandList);
+            assert!(copy_within_window(dl2.as_raw(), buf.as_raw() as usize, 0x280, 0x200, 8));
             dl2.CopyBufferRegion(&rb, 0, &buf, 0x100, 8);
             dl2.CopyBufferRegion(&rb, 8, &buf, 0x180, 8);
             dl2.CopyBufferRegion(&rb, 16, &buf, 0x200, 8);
+            dl2.CopyBufferRegion(&rb, 24, &buf, 0x280, 8);
             dl2.Close().unwrap();
             let dcl2: ID3D12CommandList = dl2.cast().unwrap();
             dq.ExecuteCommandLists(&[Some(dcl2)]);
@@ -5223,6 +5298,7 @@ mod tests {
             let gpu_direct = *(rb_ptr as *const u64);
             let gpu_comp = *((rb_ptr as *const u64).add(1));
             let gpu_copy = *((rb_ptr as *const u64).add(2));
+            let gpu_same_window = *((rb_ptr as *const u64).add(3));
             rb.Unmap(0, None);
 
             drop(dl);
@@ -5234,6 +5310,7 @@ mod tests {
 
             assert_eq!(cpu_direct, 0x677, "DIRECT WriteBufferImmediate must be visible to CPU (gpu={gpu_direct:#x})");
             assert_eq!(cpu_comp, 0x1122_3344_0000_0677, "COMPUTE WriteBufferImmediate must be visible to CPU (gpu={gpu_comp:#x})");
+            assert_eq!(gpu_same_window, 0xCAFE_BABE_DEAD_BEEF, "same-window CopyMemoryToMemoryX");
             assert_eq!(cpu_copy, 0xCAFE_BABE_DEAD_BEEF, "DIRECT CopyBufferRegion must be visible to CPU (gpu={gpu_copy:#x})");
         }
     }

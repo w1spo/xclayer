@@ -352,6 +352,33 @@ fn scan_page(page: &[u8], pg: usize, slot: &mut Option<Box<[u64; CHUNKS]>>, out:
     }
 }
 
+/// Apply a GPU readback to one committed page. A partial chunk only becomes clean
+/// if the CPU bytes outside the copied span were already in sync.
+fn apply_readback(page: &mut [u8], offset: usize, data: &[u8], slot: &mut Option<Box<[u64; CHUNKS]>>) {
+    let end = offset + data.len();
+    let first = offset / CHUNK;
+    let last = end.div_ceil(CHUNK);
+    let previous = slot.as_deref().unwrap_or(&ZERO_HASHES);
+    let clean_edge = |k: usize| {
+        let start = k * CHUNK;
+        (offset <= start && start + CHUNK <= end)
+            || chunk_hash(&page[start..start + CHUNK]) == previous[k]
+    };
+    let first_clean = clean_edge(first);
+    let last_clean = clean_edge(last - 1);
+    page[offset..end].copy_from_slice(data);
+    for k in first..last {
+        if (k == first && !first_clean) || (k == last - 1 && !last_clean) {
+            continue;
+        }
+        let start = k * CHUNK;
+        let hash = chunk_hash(&page[start..start + CHUNK]);
+        if hash != ZERO_HASH || slot.is_some() {
+            slot.get_or_insert_with(|| Box::new(ZERO_HASHES))[k] = hash;
+        }
+    }
+}
+
 /// The byte ranges (offset, length) of `page` whose 64-byte chunks differ from `sent`
 /// (updated to the page's chunks).
 pub fn changed_chunks(page: &[u8], sent: &mut [u64; CHUNKS]) -> Vec<(usize, usize)> {
@@ -403,6 +430,16 @@ pub fn pool_bytes() -> (usize, usize) {
     let pools = s.pools.iter().filter(|p| p.is_some()).count() * POOL_TILES as usize * TILE;
     (pools, pools.saturating_sub(s.free.len() * TILE))
 }
+/// Best-effort snapshot of sparse pool residency. Retired heaps are still owned,
+/// even though the original pool_bytes() counters exclude them.
+/// (active pools, retired pools, mapped tiles, pinned tiles, free tiles, ring bytes in flight, transfer failed)
+pub fn pool_diagnostics() -> Option<(usize, usize, usize, usize, usize, u64, bool)> {
+    STATE.try_lock().ok().map(|g| g.as_ref().map_or((0, 0, 0, 0, 0, 0, false), |s| {
+        (s.pools.iter().filter(|p| p.is_some()).count(), s.retired.len(), s.mapped.len(),
+         s.pinned.len(), s.free.len(), s.ring_submitted.saturating_sub(s.ring_free), s.transfer_failed)
+    }))
+}
+
 /// commits before the device existed: the pages committed, as disjoint page ranges (start →
 /// end) merged with their neighbours, so a commit or decommit costs O(log n) and not a scan of
 /// every page committed so far. Like `committed` / `decommitted` with a state, a range counts
@@ -961,37 +998,6 @@ impl State {
         }
     }
 
-    /// Update `sent` hashes for all 64-byte chunks overlapping `[va, va + len)` so the CPU
-    /// copy-back we just wrote to `va` is not re-uploaded by the next `before_execute`.
-    unsafe fn sync_sent_range(&mut self, va: usize, len: usize) {
-        if len == 0 {
-            return;
-        }
-        let mut pg = va & !(PAGE - 1);
-        let end = va + len;
-        while pg < end {
-            let t = pg & !(TILE - 1);
-            let tile_end = (t + TILE).min(end);
-            if let Some(entry) = self.mapped.get_mut(&t) {
-                let mut p = pg;
-                while p < tile_end {
-                    let idx = (p - t) / PAGE;
-                    if entry.holes & (1u16 << idx) == 0 {
-                        let bytes = std::slice::from_raw_parts(p as *const u8, PAGE);
-                        let sent = entry.sent[idx].get_or_insert_with(|| Box::new(ZERO_HASHES));
-                        let lo = va.saturating_sub(p) / CHUNK;
-                        let hi = (end.min(p + PAGE) - p).div_ceil(CHUNK).min(CHUNKS);
-                        for k in lo..hi {
-                            sent[k] = chunk_hash(&bytes[k * CHUNK..(k + 1) * CHUNK]);
-                        }
-                    }
-                    p += PAGE;
-                }
-            }
-            pg = tile_end;
-        }
-    }
-
     /// Copy `ranges` (address, bytes) from sparse VRAM back into the CPU view and refresh
     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
@@ -1032,13 +1038,14 @@ impl State {
                     let t = pg & !(TILE - 1);
                     let idx = (pg - t) / PAGE;
                     let step = (pg + PAGE).min(end) - at;
-                    if s.mapped.get(&t).is_some_and(|e| e.holes & (1u16 << idx) == 0) {
-                        std::ptr::copy_nonoverlapping(p.add(src_off), at as *mut u8, step);
+                    if let Some(entry) = s.mapped.get_mut(&t).filter(|e| e.holes & (1u16 << idx) == 0) {
+                        let page = std::slice::from_raw_parts_mut(pg as *mut u8, PAGE);
+                        let data = std::slice::from_raw_parts(p.add(src_off), step);
+                        apply_readback(page, at - pg, data, &mut entry.sent[idx]);
                     }
                     at += step;
                     src_off += step;
                 }
-                s.sync_sent_range(dst, len);
             }
             pending.clear();
             *used = 0;
@@ -1225,9 +1232,33 @@ pub unsafe fn free(p: usize) -> bool {
     // decommitted before the address goes back: once released, another thread may get it,
     // commit it and write there
     let Some((start, len)) = u.sparse_reservation(p).filter(|&(start, _)| start == p) else { return false };
-    decommitted(start, len);
-    VirtualFree(p as *mut c_void, len, MEM_DECOMMIT);
+    if decommit_cpu(start, len) == 0 {
+        return false;
+    }
     u.sparse_release(p).is_some()
+}
+
+/// Validate the complete range before any readback or CPU scan. Adjacent sparse
+/// windows may be crossed, but a gap or overflow is not a readable range.
+fn checked_readback_end(a: usize, n: usize, mut window_end: impl FnMut(usize) -> Option<usize>) -> Option<usize> {
+    if n == 0 { return None; }
+    let end = a.checked_add(n)?;
+    let mut cur = a;
+    while cur < end {
+        let next = window_end(cur)?.min(end);
+        if next <= cur { return None; }
+        cur = next;
+    }
+    Some(end)
+}
+
+impl State {
+    fn readback_end(&self, a: usize, n: usize) -> Option<usize> {
+        checked_readback_end(a, n, |cur| {
+            let wi = self.window_index(cur)?;
+            self.windows[wi].0.checked_add(crate::gpu::uma::WINDOW)
+        })
+    }
 }
 
 /// After `queue.ExecuteCommandLists`: copy GPU-written sparse ranges (e.g. `Write32/64`,
@@ -1244,7 +1275,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
-    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| n > 0 && s.window_index(a).is_some()).collect();
+    let mut filtered: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, n)| s.readback_end(a, n).is_some()).collect();
     if filtered.is_empty() {
         return;
     }
@@ -1282,7 +1313,8 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     }
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
-    if s.transfer_failed || s.window_index(va).is_none() { return; }
+    if s.transfer_failed { return; }
+    let Some(end) = s.readback_end(va, len) else { return };
     let zeroed = std::mem::take(&mut s.to_zero);
     if !zeroed.is_empty() {
         for &(a, n) in &zeroed {
@@ -1293,7 +1325,6 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     // Preserve any unsubmitted CPU writes on pages overlapping `[va, va + len)`
     let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
     let mut pg = va & !(PAGE - 1);
-    let end = va + len;
     while pg < end {
         let t = pg & !(TILE - 1);
         let tile_end = (t + TILE).min(end);
@@ -1353,11 +1384,33 @@ pub unsafe fn committed(a: usize, n: usize) {
 /// The title decommitted `[a, a + n)`: tiles whose pages are all uncommitted (whether in one
 /// full-tile decommit or incrementally via sub-tile decommits) give their video memory back
 /// (unless a placed buffer still pins the pool tile).
-pub unsafe fn decommitted(a: usize, n: usize) {
+// Keep the CPU decommit and GPU bookkeeping under the same lock that protects
+// CPU page reads during sparse uploads/readback. Failed Windows calls leave
+// both the mappings and the reservation ownership unchanged.
+pub unsafe fn decommit_cpu(a: usize, n: usize) -> i32 {
+    use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+    let mut g = STATE.lock().unwrap();
+    let ok = VirtualFree(a as *mut c_void, n, MEM_DECOMMIT);
+    let error = GetLastError();
+    record_decommit_if_success(ok, || decommitted_locked(&mut g, a, n));
+    drop(g);
+    SetLastError(error);
+    ok
+}
+
+fn record_decommit_if_success(ok: i32, record: impl FnOnce()) {
+    if ok != 0 { record(); }
+}
+
+#[cfg(test)]
+unsafe fn decommitted(a: usize, n: usize) {
+    decommitted_locked(&mut STATE.lock().unwrap(), a, n);
+}
+
+unsafe fn decommitted_locked(g: &mut Option<State>, a: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else {
         let (start, end) = page_span(a, n);
         early_remove(&mut EARLY.lock().unwrap(), start, end);
@@ -1514,6 +1567,13 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: 
     }
 }
 
+/// A placed buffer must cover every tile, even if the CPU pages inside a tile
+/// are holes. A partial tile allocation is not a successful placement.
+fn complete_buffer_tiles(start: usize, end: usize, mut tile: impl FnMut(usize) -> Option<(u32, u32)>) -> Option<Vec<(usize, (u32, u32))>> {
+    if start >= end || start % TILE != 0 { return None; }
+    (start..end).step_by(TILE).map(|t| tile(t).map(|pool| (t, pool))).collect()
+}
+
 /// A buffer the title places at `va` in a sparse window (`bytes` long, `desc` the PC
 /// description): a reserved resource over the window's tiles there, starting at the 64 KiB
 /// below `va` (returned: its distance from there).
@@ -1527,10 +1587,10 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     if bytes == 0 {
         return None;
     }
-    s.window_index(start)?;
-    s.window_index(va.checked_add(bytes)?.checked_sub(1)?)?;
+    let span = delta.checked_add(bytes)?;
+    let end = s.readback_end(start, span)?;
     let mut d = *desc;
-    d.Width = (delta + bytes) as u64;
+    d.Width = span as u64;
     d.Alignment = 0;
     d.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
     // Reserved buffers only accept NONE or ALLOW_UNORDERED_ACCESS (strip console flags and ALLOW_CROSS_ADAPTER).
@@ -1544,9 +1604,17 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     }
     // its tiles: the window's video memory at the same addresses; probe actual OS commitment
     // so uncommitted pages (e.g. [start, va) or reserved tails) stay marked as holes
-    s.ensure_mapped(start, delta + bytes, |t| query_tile_holes(t));
-    let tiles: Vec<(usize, (u32, u32))> = (start..va + bytes).step_by(TILE).filter_map(|t| s.mapped.get(&t).map(|e| (t, e.pool))).collect();
+    s.ensure_mapped(start, span, |t| query_tile_holes(t));
     let raw = *ppv;
+    let tiles = complete_buffer_tiles(start, end, |t| s.mapped.get(&t).map(|e| e.pool));
+    let Some(tiles) = tiles.filter(|_| !s.transfer_failed) else {
+        // No mapping of this resource has been submitted. The window's own
+        // tiles remain tracked; abandon only this incomplete resource.
+        drop(g);
+        drop(windows::core::IUnknown::from_raw(raw));
+        *ppv = std::ptr::null_mut();
+        return None;
+    };
     let res = ID3D12Resource::from_raw_borrowed(&raw)?.clone();
     s.map_tiles(&res, start, &tiles);
     for &(_, tile) in &tiles {
@@ -1577,6 +1645,63 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_gpu_readback_keeps_adjacent_cpu_edits_dirty() {
+        let mut page = [0; PAGE];
+        let mut sent = None;
+        page[8] = 9;
+        page[CHUNK * 2 + 20] = 10;
+        apply_readback(&mut page, 16, &[7; CHUNK * 2], &mut sent);
+        assert_eq!(page[8], 9);
+        assert_eq!(page[16], 7);
+        assert_eq!(page[CHUNK * 2 + 20], 10);
+        let mut dirty = Vec::new();
+        scan_page(&page, 0, &mut sent, &mut dirty);
+        assert_eq!(dirty, [(0, CHUNK), (CHUNK * 2, CHUNK)]);
+
+        apply_readback(&mut page, 24, &[3; 8], &mut sent);
+        dirty.clear();
+        scan_page(&page, 0, &mut sent, &mut dirty);
+        assert!(dirty.is_empty());
+    }
+
+    #[test]
+    fn readback_ranges_must_fit_contiguous_sparse_windows() {
+        let window = crate::gpu::uma::WINDOW;
+        let base = 4 * window;
+        let window_end = |a: usize| {
+            [base, base + window, base + 3 * window].into_iter()
+                .find(|&b| a >= b && a < b + window).map(|b| b + window)
+        };
+        assert_eq!(checked_readback_end(base + window - 4, 8, window_end), Some(base + window + 4));
+        assert_eq!(checked_readback_end(base + 2 * window - 4, 8, window_end), None);
+        assert_eq!(checked_readback_end(base + 3 * window, window, window_end), Some(base + 4 * window));
+        assert_eq!(checked_readback_end(base, usize::MAX, window_end), None);
+        assert_eq!(checked_readback_end(base, 0, window_end), None);
+        assert_eq!(checked_readback_end(base, 4, |_| Some(base)), None);
+    }
+
+    #[test]
+    fn a_placed_buffer_requires_every_tile() {
+        let start = 4 * TILE;
+        let end = start + 2 * TILE + 1;
+        assert!(complete_buffer_tiles(start, end, |t| (t != start + TILE).then_some((0, 1))).is_none());
+        assert_eq!(complete_buffer_tiles(start, end, |t| Some((0, (t / TILE) as u32))).unwrap(),
+            vec![(start, (0, 4)), (start + TILE, (0, 5)), (start + 2 * TILE, (0, 6))]);
+        assert!(complete_buffer_tiles(start + 1, end, |_| Some((0, 0))).is_none());
+        assert!(complete_buffer_tiles(start, start, |_| Some((0, 0))).is_none());
+    }
+
+    #[test]
+    fn failed_cpu_decommit_keeps_sparse_tracking() {
+        let a = 0x4_2000_0000usize;
+        let mut early = BTreeMap::from([(a, a + 2 * TILE)]);
+        record_decommit_if_success(0, || early_remove(&mut early, a, a + TILE));
+        assert_eq!(early.get(&a), Some(&(a + 2 * TILE)));
+        record_decommit_if_success(1, || early_remove(&mut early, a, a + TILE));
+        assert_eq!(early.into_iter().collect::<Vec<_>>(), vec![(a + TILE, a + 2 * TILE)]);
+    }
 
     #[test]
     fn ring_capacity_rejects_overwrite_and_reversed_cursors() {
@@ -1733,7 +1858,7 @@ mod tests {
     }
 
     /// Mapping tiles for a placed buffer over partially-committed/reserved memory must preserve
-    /// uncommitted hole bits so `readback_ranges` / `sync_sent_range` do not access-violate,
+    /// uncommitted hole bits so `readback_ranges` do not access-violate,
     /// and later commits clear those hole bits so subsequent writes scan cleanly.
     #[test]
     fn ensure_mapped_with_query_holes_skips_uncommitted_pages_on_readback() {

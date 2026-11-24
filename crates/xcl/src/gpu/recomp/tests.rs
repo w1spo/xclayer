@@ -2899,6 +2899,27 @@ fn gpu_mesh_mode_two_passes() {
     assert!(px16 == px, "split pass-through draws the same pixels");
 }
 
+#[test]
+fn mesh_output_budget_rounds_declared_vertices_and_expands_even_one_group() {
+    use super::MsInterface;
+    let mut ms = MsInterface { threads: 32, max_vertices: 97, max_primitives: 1, outputs: Vec::new() };
+    let inputs: Vec<_> = (0..16)
+        .map(|k| crate::gpu::dxbc::SigElement {
+            name: "TEXCOORD".into(), index: k, register: k + 1, system_value: 0,
+            component_type: 3, mask: 15, rw_mask: 15, stream: 0,
+        })
+        .collect();
+    let pass = |ms: &MsInterface| super::emit::mesh_passthrough_for(ms, Some(&inputs));
+    assert_eq!(super::emit::passthrough_split(&ms, inputs.len()), 1);
+    assert!(pass(&ms).contains("out vertices XclVert verts[3]"));
+    ms.max_primitives = 128;
+    assert_eq!(super::emit::passthrough_split(&ms, inputs.len()), 4);
+    assert!(pass(&ms).contains("out vertices XclVert verts[96]"));
+    ms.max_vertices = 96;
+    assert_eq!(super::emit::passthrough_split(&ms, inputs.len()), 1);
+    assert!(pass(&ms).contains("out indices uint3 tris[128]"));
+}
+
 /// DXC optimisation levels on a saved HLSL file (`XCL_TIME_HLSL=path`, profile in `XCL_TIME_PROFILE`).
 #[test]
 #[ignore]

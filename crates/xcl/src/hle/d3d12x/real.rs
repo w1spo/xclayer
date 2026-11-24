@@ -2126,6 +2126,12 @@ fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADE
 }
 
 type MadeKey = (usize, u64, [u8; 0x38]);
+static MADE: Mutex<Option<HashMap<MadeKey, usize>>> = Mutex::new(None);
+
+/// The number of retained address-view resources, not a byte count or proof of a leak.
+pub fn made_cache_count() -> Option<usize> {
+    MADE.try_lock().ok().map(|g| g.as_ref().map_or(0, HashMap::len))
+}
 
 /// Return the cached winner, leaving its owning reference in the map. A concurrent
 /// successful miss must not replace that reference (live descriptors may name it).
@@ -2139,7 +2145,6 @@ fn remember_made(cache: &mut HashMap<MadeKey, usize>, key: MadeKey, hr: i32, res
 /// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
 /// per address and desc – titles make views of the same memory again and again.
 unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
-    static MADE: Mutex<Option<HashMap<MadeKey, usize>>> = Mutex::new(None);
     // Only misses enter this gate. Creating a second texture at the same address
     // can shadow the first one before either descriptor is published.
     static CREATE: Mutex<()> = Mutex::new(());

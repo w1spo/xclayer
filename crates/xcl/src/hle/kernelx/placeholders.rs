@@ -126,8 +126,7 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
             return fail();
         }
         let len = if size == 0 { r.end - base } else { size };
-        super::super::d3d12x::sparse::decommitted(base, len);
-        return Some(mem::VirtualFree(addr, len, mem::MEM_DECOMMIT));
+        return Some(super::super::d3d12x::sparse::decommit_cpu(base, len));
     }
     if start != base || (flags != PRESERVE && flags != mem::MEM_RELEASE) || (flags == mem::MEM_RELEASE && size != 0)
         || (flags == PRESERVE && size != 0 && size != r.end - base)
@@ -139,8 +138,7 @@ pub(super) unsafe fn free(addr: *mut c_void, size: usize, flags: u32) -> Option<
     let mut mappings = super::AWAY.lock().unwrap();
     if !r.placeholder {
         if !super::unmap_pages_in(&mut mappings, base, r.end) { return Some(0); }
-        super::super::d3d12x::sparse::decommitted(base, r.end - base);
-        if mem::VirtualFree(addr, r.end - base, mem::MEM_DECOMMIT) == 0 {
+        if super::super::d3d12x::sparse::decommit_cpu(base, r.end - base) == 0 {
             return Some(0);
         }
     }

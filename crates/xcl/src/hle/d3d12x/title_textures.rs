@@ -38,8 +38,8 @@ extern "system" {
     fn GetWriteWatch(flags: u32, base: *const c_void, size: usize, addresses: *mut *mut c_void, count: *mut usize, granularity: *mut u32) -> u32;
 }
 
-/// (device, address its bytes are read from, layout, states) of an upload
-type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>);
+/// (device, address its bytes are read from, layout, states, registration sequence) of an upload
+type Upload = (usize, usize, Arc<xg::Texture>, Vec<D3D12_RESOURCE_STATES>, u64);
 
 struct Entry {
     device: usize,
@@ -58,6 +58,8 @@ struct Entry {
     states: Vec<D3D12_RESOURCE_STATES>,
     /// not uploaded yet (made since the last submit)
     pending: bool,
+    /// Retry budget for the current upload; refreshed on a new dirty-page event or remap.
+    retries: u8,
     /// the title's GPU work wrote it (CopyTextureRegion into it): its CPU view is stale from
     /// then on and no longer uploaded
     gpu_written: bool,
@@ -69,7 +71,18 @@ struct Entry {
     seq: u64,
 }
 
-/// textures waiting for their first upload
+impl Entry {
+    /// Do not turn a failed CPU upload into a later overwrite of GPU-written content.
+    fn cancel_gpu_retry(&mut self) -> bool {
+        if self.pending && self.retries != 0 && self.gpu_written {
+            self.pending = false;
+            return true;
+        }
+        false
+    }
+}
+
+/// textures waiting for their first upload or a retry
 static PENDING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // raw COM pointers of the title's objects; uploads hold a reference while they run
@@ -262,6 +275,7 @@ impl Table {
                     to_remap.push(sres);
                     if !e.gpu_written {
                         e.pending = true;
+                        e.retries = 0;
                     }
                 }
                 if e.pending {
@@ -275,6 +289,18 @@ impl Table {
             self.max_shadowed_size = 0;
         }
         (true, pending_delta, to_remap)
+    }
+
+    /// A failed upload has consumed the write-watch notification. Requeue it at
+    /// most twice, only while the same active CPU-owned texture still needs it.
+    fn retry_upload(&mut self, res: usize, seq: u64, src: usize) -> bool {
+        let Some(e) = self.by_res.get_mut(&res) else { return false };
+        if e.seq != seq || e.src != src || e.gpu_written || e.pending || e.retries >= 2 {
+            return false;
+        }
+        e.retries += 1;
+        e.pending = true;
+        true
     }
 
     fn get_mut(&mut self, res: usize) -> Option<&mut Entry> {
@@ -382,6 +408,7 @@ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, 
         tex: Arc::new(tex),
         states: vec![state],
         pending: true,
+        retries: 0,
         gpu_written: false,
         placed: super::vram::is_placed_texture(res as usize),
         unmapped: false,
@@ -458,6 +485,7 @@ fn recheck_source(e: &mut Entry) -> bool {
     }
     e.src = src;
     e.pending = true;
+    e.retries = 0;
     true
 }
 
@@ -625,6 +653,14 @@ thread_local! {
     static DIRTY_BUF: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Page-aligned write-watch range. An invalid span is not a request to scan
+/// the address space near zero or the top of the address space.
+fn watched_span(src: usize, len: usize) -> Option<(usize, usize)> {
+    if len == 0 { return None; }
+    let end = src.checked_add(len)?.checked_next_multiple_of(0x1000)?;
+    Some((src & !0xFFF, end))
+}
+
 fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     let key = (
         super::sparse::mapped_gen(),
@@ -643,7 +679,7 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
     // write-watched regions) only when the set of textures, tiles, or reservations changed.
     let mut regions = u.watch_regions();
     regions.extend(crate::hle::kernelx::graphics_reservations());
-    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().map(|e| (e.src & !0xFFF, (e.src + e.tex.size() as usize + 0xFFF) & !0xFFF)).collect();
+    let mut wanted: Vec<(usize, usize)> = TEXTURES.lock().unwrap().by_res.values().filter_map(|e| watched_span(e.src, e.tex.size() as usize)).collect();
     wanted.extend(super::sparse::mapped_ranges());
     let computed = Arc::new(watch_ranges(&regions, wanted));
     *WATCH_CACHE.lock().unwrap() = Some((key, Arc::clone(&computed)));
@@ -671,7 +707,13 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         return;
     }
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    own_work(|| {
+        refresh_once(queue);
+        // GPU-owned placed textures still need their mappings when no CPU mirror exists.
+        if let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) {
+            super::vram::before_execute(q);
+        }
+    });
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -679,18 +721,22 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
 /// `base` walked the pages already reset each time (4 GiB with every page written: 105 ms a
 /// look, 47 ms going on).
 unsafe fn take_written(base: usize, size: usize, buf: &mut [*mut c_void], dirty: &mut Vec<usize>, page: &mut u32) {
-    let end = base + size;
+    let Some(end) = base.checked_add(size) else { return };
+    if buf.is_empty() { return; }
     let mut at = base;
     while at < end {
         let mut n = buf.len();
         if GetWriteWatch(WRITE_WATCH_FLAG_RESET, at as *const c_void, end - at, buf.as_mut_ptr(), &mut n, page) != 0 {
             break;
         }
+        if n > buf.len() { break; }
         dirty.extend(buf[..n].iter().map(|&p| p as usize));
         if n == 0 || n < buf.len() {
             break;
         }
-        at = buf[n - 1] as usize + *page as usize;
+        let Some(next) = (buf[n - 1] as usize).checked_add(*page as usize) else { break };
+        if next <= at { break; }
+        at = next;
     }
 }
 
@@ -754,7 +800,6 @@ unsafe fn refresh_once(queue: *mut c_void) {
         DIRTY_BUF.with(|dcell| {
             let dirty = dcell.borrow();
             super::sparse::before_execute(q, &dirty, page as usize);
-            super::vram::before_execute(q);
         });
     }
     if dirty_len == 0 && PENDING.load(Ordering::Relaxed) == 0 {
@@ -768,22 +813,29 @@ unsafe fn refresh_once(queue: *mut c_void) {
         t.by_res
             .iter_mut()
             .filter(|(_, e)| {
+                let Some(end) = e.src.checked_add(e.tex.size() as usize) else { return false };
                 if e.pending {
                     return true;
                 }
                 if e.gpu_written {
                     return false;
                 }
-                let i = dirty.partition_point(|&p| p + page as usize <= e.src);
-                dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
+                let i = dirty.partition_point(|&p| p.saturating_add(page as usize) <= e.src);
+                dirty.get(i).is_some_and(|&p| p < end)
             })
             .filter_map(|(&res, e)| {
+                if e.cancel_gpu_retry() {
+                    adjust_pending(-1);
+                    return None;
+                }
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
+                } else {
+                    e.retries = 0;
                 }
                 let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone(), e.seq)))
             })
             .collect()
     });
@@ -835,6 +887,13 @@ fn content_hash(b: &[u8]) -> u64 {
 /// staging bytes of one batch at most
 const BATCH_BYTES: usize = 256 << 20;
 
+fn retry_failed_upload(res: usize, seq: u64, src: usize) {
+    let mut t = TEXTURES.lock().unwrap();
+    if t.retry_upload(res, seq, src) {
+        adjust_pending(1);
+    }
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -849,11 +908,11 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         let mut hashes = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
-        while let Some((_, (dev, _, tex, _))) = todo.peek() {
+        while let Some((_, (dev, _, tex, _, _))) = todo.peek() {
             if !picked.is_empty() && (bytes + tex.size() as usize > BATCH_BYTES || *dev != device) {
                 break;
             }
-            let (r, (dev, va, tex, states)) = todo.next().unwrap();
+            let (r, (dev, va, tex, states, seq)) = todo.next().unwrap();
             // The same bytes as at this texture's last upload: nothing to do. The write watch is
             // per page and a title writes next to its textures (and rewrites what it wrote): a
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
@@ -872,7 +931,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             // On any later error (including partial GPU execution) old content is not trusted.
             invalidate_upload(r.as_raw() as usize);
-            hashes.push(hash);
+            hashes.push((hash, seq, va));
             device = dev;
             bytes += tex.size() as usize;
             picked.push((r, va, tex, states));
@@ -889,11 +948,20 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             batch.push((r, subs, states));
         }
         let d = device as *mut c_void;
-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+        let retry_batch = || {
+            for ((r, _, _), &(_, seq, src)) in batch.iter().zip(&hashes) {
+                retry_failed_upload(r.as_raw() as usize, seq, src);
+            }
+        };
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
+            retry_batch();
+            continue;
+        };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
                 warn(&e);
+                retry_batch();
                 continue;
             }
         };
@@ -910,17 +978,22 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
                     warn(&e);
                 }
                 let mut completed = 0u64;
-                for (i, ((r, _, _), hash)) in batch.iter().zip(hashes).enumerate() {
+                for (i, ((r, _, _), &(hash, seq, src))) in batch.iter().zip(&hashes).enumerate() {
                     if !rejected[i] {
                         completed += 1;
                         if let Some(h) = hash {
                             remember_upload(r.as_raw() as usize, h);
                         }
+                    } else {
+                        retry_failed_upload(r.as_raw() as usize, seq, src);
                     }
                 }
                 UPLOADS.fetch_add(completed, Ordering::Relaxed);
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                warn(&e);
+                retry_batch();
+            }
         }
     }
 }
@@ -1061,6 +1134,7 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     wanted.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in wanted {
+        if a >= b { continue; }
         match merged.last_mut() {
             Some(last) if a <= last.1.saturating_add(WATCH_GAP) => last.1 = last.1.max(b),
             _ => merged.push((a, b)),
@@ -1069,7 +1143,8 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     let mut out = Vec::new();
     for (a, b) in merged {
         for &(base, size) in regions {
-            let (lo, hi) = (a.max(base), b.min(base + size));
+            let Some(limit) = base.checked_add(size) else { continue };
+            let (lo, hi) = (a.max(base), b.min(limit));
             if lo < hi {
                 out.push((lo, hi - lo));
             }
@@ -1423,7 +1498,7 @@ mod tests {
             d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
             d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
             let tex = Arc::new(xg::Texture::new(&d).unwrap());
-            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+            let mut e = Entry { device: 0, va: at, src: mirror_source(at), in_gpu_view: true, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, retries: 0, gpu_written: false, placed: false, unmapped: false, seq: 0 };
             assert_eq!(e.src, cpu + 0x2_0000);
             assert!(!recheck_source(&mut e), "nothing changed yet");
             assert_eq!(kernelx::MapTitlePhysicalPages(at as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, at);
@@ -1521,7 +1596,7 @@ mod tests {
         assert_eq!(subresource_count(&tex), 6);
         // fake resource / list keys, never dereferenced: GPU-written, so no refresh uploads it
         let (res, other, l1, l2) = (0x7E57_0000_1000usize, 0x7E57_0000_2000usize, 0x7E57_0000_3000usize, 0x7E57_0000_4000usize);
-        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+        TEXTURES.lock().unwrap().insert(res, Entry { device: 0, va: 0x7E57_0000_0000, src: 0x7E57_0000_0000, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, retries: 0, gpu_written: true, placed: false, unmapped: false, seq: 0 });
         TEXTURES_LEN.fetch_add(1, Ordering::Relaxed);
         let states = || TEXTURES.lock().unwrap().by_res.get(&res).unwrap().states.clone();
         let (p1, p2) = (l1 as *mut c_void, l2 as *mut c_void);
@@ -1588,6 +1663,17 @@ mod tests {
         assert_eq!(watch_ranges(&regions, wanted), vec![(0x1000_0000, 0x8_1000), (0x1100_0000, 0x1000)]);
     }
 
+    #[test]
+    fn write_watch_rejects_invalid_spans() {
+        assert_eq!(watched_span(0x1234, 0x1000), Some((0x1000, 0x3000)));
+        assert_eq!(watched_span(0x1000, 0x1000), Some((0x1000, 0x2000)));
+        assert_eq!(watched_span(0x1000, 0), None);
+        assert_eq!(watched_span(usize::MAX - 3, 8), None);
+        assert_eq!(watched_span(usize::MAX - 3, 1), None);
+        assert_eq!(watch_ranges(&[(0x1000, 0x10000), (usize::MAX - 5, 10)],
+            vec![(0x2000, 0x2000), (0x3000, 0x1000), (0x4000, 0x5000)]), vec![(0x4000, 0x1000)]);
+    }
+
     /// The textures of a batch detiled on several threads come back as on one: complete and in
     /// order (2D with mips and slices, 3D, BC7, a tiny one; more textures than threads).
     #[test]
@@ -1627,6 +1713,35 @@ mod tests {
         d
     }
 
+    #[test]
+    fn failed_upload_requeues_only_the_current_cpu_owned_texture_with_a_budget() {
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let mut t = Table::new();
+        let entry = Entry { device: 0, va: 0x10000, src: 0x10000, in_gpu_view: false,
+            tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false,
+            retries: 0, gpu_written: false, placed: false, unmapped: false, seq: 0 };
+        t.insert(1, entry);
+        let seq = t.by_res[&1].seq;
+        assert!(!t.retry_upload(1, seq + 1, 0x10000));
+        assert!(!t.retry_upload(1, seq, 0x20000));
+        assert!(t.retry_upload(1, seq, 0x10000));
+        assert!(!t.retry_upload(1, seq, 0x10000));
+        t.by_res.get_mut(&1).unwrap().pending = false;
+        assert!(t.retry_upload(1, seq, 0x10000));
+        t.by_res.get_mut(&1).unwrap().pending = false;
+        assert!(!t.retry_upload(1, seq, 0x10000));
+        t.by_res.get_mut(&1).unwrap().retries = 0;
+        assert!(t.retry_upload(1, seq, 0x10000));
+        let e = t.by_res.get_mut(&1).unwrap();
+        e.gpu_written = true;
+        assert!(e.cancel_gpu_retry());
+        assert!(!e.pending);
+        assert!(!e.cancel_gpu_retry());
+        assert!(!t.retry_upload(1, seq, 0x10000));
+        t.remove(1);
+        assert!(!t.retry_upload(1, seq, 0x10000));
+    }
+
     /// Overlapping textures shadow earlier ones so dead placements never re-upload over shared
     /// `vram::Pages` tiles; different-range overlaps request unmapping while exact same-range
     /// overlaps stay mapped; releasing a newer placement reactivates uncovered older ones.
@@ -1643,6 +1758,7 @@ mod tests {
             tex: Arc::clone(tex),
             states: vec![D3D12_RESOURCE_STATE_COMMON],
             pending,
+            retries: 0,
             gpu_written: false,
             placed,
             unmapped: false,

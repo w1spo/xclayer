@@ -210,9 +210,15 @@ pub mod mirrors {
 
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
     pub fn source(va: usize) -> Option<usize> {
+        source_range(va, 1)
+    }
+
+    /// Resolve a span that fits in one paired GPU reservation.
+    pub fn source_range(va: usize, bytes: usize) -> Option<usize> {
         let s = STATE.lock().unwrap();
         let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
-        (va < gpu + size).then(|| cpu + (va - gpu))
+        let offset = va - gpu;
+        (offset < size && bytes <= size - offset).then(|| cpu + offset)
     }
 }
 
@@ -427,10 +433,8 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             if let Some(g) = mappings.as_mut() {
                 if !unmap_pages_in(g, a, a.saturating_add(n)) { return 0; }
             }
-            // sparse first: under its lock, so no copy of CPU writes to video memory reads the
-            // pages while they go (the submit thread's copy faulted on them)
-            crate::hle::d3d12x::sparse::decommitted(a, n);
-            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+            // Sparse CPU decommit and GPU bookkeeping are serialized with uploads.
+            if crate::hle::d3d12x::sparse::decommit_cpu(a, n) == 0 {
                 return 0;
             }
         }
@@ -529,6 +533,7 @@ struct XMemLive {
     // free's bookkeeping runs; never remove a newer allocation.
     entries: std::collections::HashMap<usize, (usize, u64)>,
     generation: u64,
+    logical_bytes: u128,
     incomplete: bool,
 }
 impl XMemLive {
@@ -539,14 +544,20 @@ impl XMemLive {
             return;
         }
         self.generation = self.generation.wrapping_add(1);
-        self.entries.insert(at, (bytes, self.generation));
+        if let Some((old, _)) = self.entries.insert(at, (bytes, self.generation)) {
+            self.logical_bytes -= old as u128;
+        }
+        self.logical_bytes += bytes as u128;
     }
     fn token(&self, at: usize) -> Option<u64> { self.entries.get(&at).map(|e| e.1) }
     fn finish_free(&mut self, at: usize, token: Option<u64>, ok: bool) {
-        if ok && token.is_some() && self.token(at) == token { self.entries.remove(&at); }
+        if ok && token.is_some() && self.token(at) == token {
+            let (bytes, _) = self.entries.remove(&at).unwrap();
+            self.logical_bytes -= bytes as u128;
+        }
     }
     fn bytes(&self) -> u64 {
-        self.entries.values().fold(0u64, |total, e| total.saturating_add(e.0 as u64))
+        self.logical_bytes.min(u64::MAX as u128) as u64
     }
 }
 static XMEM_LIVE: std::sync::Mutex<Option<XMemLive>> = std::sync::Mutex::new(None);
@@ -627,8 +638,11 @@ pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
     let token = XMEM_LIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.token(at));
     let ok = if XAllocAttrs::decode(attrs).memory_type == 0 {
         aligned_heap_free(p)
+    } else if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
+        // A failed sparse free is not permission to release the enclosing Windows reservation.
+        crate::hle::d3d12x::sparse::free(at)
     } else {
-        crate::hle::d3d12x::sparse::free(at) || crate::gpu::uma::get().is_some_and(|u| u.free(at)) || mem::VirtualFree(p, 0, mem::MEM_RELEASE) != 0
+        crate::gpu::uma::get().is_some_and(|u| u.free(at)) || mem::VirtualFree(p, 0, mem::MEM_RELEASE) != 0
     };
     let error = fnd::GetLastError();
     if let Some(m) = XMEM_LIVE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -1048,9 +1062,10 @@ unsafe fn give_back_homes(away: &mut Away) {
             i += 1;
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(start)) {
-            crate::hle::d3d12x::sparse::decommitted(start, end - start);
+            crate::hle::d3d12x::sparse::decommit_cpu(start, end - start);
+        } else {
+            mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT);
         }
-        mem::VirtualFree(start as *mut c_void, end - start, mem::MEM_DECOMMIT);
     }
 }
 
@@ -1147,9 +1162,10 @@ unsafe fn unmap_away_with(away: &mut Away, at: usize, committed: &std::ops::Rang
     // (an address among the homes the caller maps back is one of them: it stays)
     if !committed.contains(&at) && !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
-            crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
+            crate::hle::d3d12x::sparse::decommit_cpu(at, PHYS_PAGE);
+        } else {
+            mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
         }
-        mem::VirtualFree(at as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT);
     }
     true
 }
@@ -2714,6 +2730,16 @@ mod tests {
         let new = m.token(0x10000);
         m.finish_free(0x10000, new, true);
         assert_eq!(m.bytes(), 256);
+    }
+
+    #[test]
+    fn default_xmem_totals_recover_after_saturation() {
+        let mut ledger = XMemLive::default();
+        ledger.record(0x10000, usize::MAX);
+        ledger.record(0x20000, 32);
+        assert_eq!(ledger.bytes(), u64::MAX);
+        ledger.finish_free(0x10000, ledger.token(0x10000), true);
+        assert_eq!(ledger.bytes(), 32);
     }
 
     #[test]

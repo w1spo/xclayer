@@ -77,13 +77,25 @@ next steps:
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
 | **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
 
-## Fork diagnostics (Patch 19)
+## Fork diagnostics (Patch 20)
 
 `detailed.txt` now includes `title_allocations`: live default XMem logical bytes, live logical physical-page bytes (a page is counted once regardless of its mapping), and explicitly committed bytes in tracked plain Windows virtual reservations. These categories are partial, not a total title-memory or host-commit figure; do not add them to process private bytes or GPU budgets. `TitleMemoryStatus` retains the existing policy and `XCL_TITLE_MEMORY_STRICT` override until all allocation paths are covered. `None` means a snapshot could not acquire its diagnostic lock.
 
 Title imports and title `GetProcAddress` lookups of the real `ntdll.dll!NtReadFile` / `NtWriteFile` prepare lazy data and metadata buffers, then call the native Windows API unchanged. Raw syscalls, other native file APIs and native path redirection are not implemented. Explicit resolver aliases continue to take precedence.
 
 A fresh, previously reserved plain-memory physical mapping of up to 64 MiB can stage its needed commits and roll them back if staging fails. Larger, overlapping and sparse mappings are not fully transactional. Failure to recommit a physical page's home now prevents unmapping that page. These fork changes require Windows and GPU regression validation.
+
+Patch 20 adds `resource_lifetime` (address-view resource count, retained title queues and deferred releases), `sparse_pool` (including retired heaps, mapped/pinned/free tiles and ring occupancy) and `bcpack_refused` (per-mode request and destination-byte counters) to `detailed.txt`. The snapshots are not additive memory accounting; `None` means the diagnostic lock was not acquired. The runtime still refuses unsupported BCPack requests. Failed CPU texture uploads are retried at most twice for the current upload, subject to active registration and GPU-write checks. No queue-retirement or arbitrary cache-eviction policy was added.
+
+Patch 21 serializes native sparse-memory decommits with GPU bookkeeping and preserves the reservation on a failed internal sparse free. Sparse readback rejects ranges that overflow or cross a non-sparse gap. Committed-only UMA fallback rejects totals that exceed the available window layout instead of truncating them. These paths still require Windows and GPU regression testing.
+
+Patch 22 separates fallback video-memory arenas by device, rejects sparse buffer placements with incomplete tile coverage, and validates texture write-watch range arithmetic. Windows and GPU regression testing are still required.
+
+Patch 23 reduces CPU-side overhead: DirectStorage workers reuse input staging (at most 8 MiB retained per worker), lazy page preparation batches lock acquisitions, DXIL flight registry cleanup is amortized, completed PSO binds avoid unnecessary build locks, and the deferred-release worker waits while idle. GPU synchronization and unsupported compression policy are unchanged. Windows regression tests and hardware profiling are required before claiming a performance improvement.
+
+Patch 24 reuses ranked shader signatures during parameter/attribute lookup and keeps an incremental total for the partial plain-virtual-memory diagnostic ledger. Shader linkage and title memory-budget policy are unchanged; Windows validation and hardware timings are pending.
+
+Patch 25 decodes BC1, BC3, BC4, BC5, BC6H and BC7 BCPack DirectStorage streams, including zlib-wrapped streams. It preserves block order for console texture uploads. BC2 and hardware swizzle options return a DirectStorage error. The patch also routes DirectStorage through paired GPU and CPU views, preserves CPU edits adjacent to sparse GPU readbacks, and fixes D3D12 mesh output sizing and same-window GPU copies. See [Patch 25 audit](PATCH25_AUDIT.md).
 
 ## Controls
 

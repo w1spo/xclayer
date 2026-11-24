@@ -26,7 +26,7 @@
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
 //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
 //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! listed are logged and answer E_NOTIMPL. The worker also decodes supported BCPack streams.
 
 #![allow(non_snake_case)]
 
@@ -44,6 +44,8 @@ use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION,
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use crate::util::{HRESULT, S_OK};
+
+mod bcpack;
 
 const DLL: &str = "xcrdapi.dll";
 
@@ -132,7 +134,7 @@ fn bcpack_name(mode: u8) -> String {
     BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
 }
 
-/// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
+/// BCPack requests refused at enqueue or rejected by the decoder, by mode.
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -196,7 +198,7 @@ pub struct BcpackStats {
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DStorageStats {
-    /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
+    /// BCPack requests refused, by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
 }
 
@@ -212,7 +214,7 @@ fn log_bcpack_refusal(r: &Request, k: u64) {
     warn_once(
         &key,
         format_args!(
-            "mode {bc} unsupported (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
+            "mode {bc} request rejected (src={}, intermediate={}, dst={}, swizzle={}); the request fails with E_DECOMPRESSION",
             r.source_size,
             r.intermediate_size,
             r.destination_size,
@@ -264,6 +266,30 @@ enum FillTarget {
     Pages(Vec<usize>),
 }
 
+/// DirectStorage can receive the GPU side of a paired reservation. Use the CPU
+/// view only when the whole span is reserved and has no direct CPU mapping.
+fn storage_address(address: usize, bytes: usize) -> usize {
+    use windows_sys::Win32::System::Memory::MEM_RESERVE;
+
+    let Some(cpu) = crate::hle::kernelx::mirrors::source_range(address, bytes) else { return address };
+    let Some(end) = address.checked_add(bytes) else { return address };
+    let mut current = address;
+    while current < end {
+        let mut region = MEMORY_BASIC_INFORMATION::default();
+        if unsafe { VirtualQuery(current as *const c_void, &mut region, std::mem::size_of_val(&region)) } == 0
+            || region.State != MEM_RESERVE
+        {
+            return address;
+        }
+        let Some(next) = (region.BaseAddress as usize).checked_add(region.RegionSize) else { return address };
+        if next <= current {
+            return address;
+        }
+        current = next;
+    }
+    cpu
+}
+
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks.
 unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let Some(block) = bcpack_fill_block(r.bcpack()) else { return false };
@@ -272,11 +298,12 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let ok = match target {
         FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
         FillTarget::Virtual => {
-            if !writable(r.destination as usize, n) {
+            let address = storage_address(r.destination as usize, n);
+            if writable_span(address, n).is_none() {
                 return false;
             }
             if n > 0 {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), r.destination as *mut u8, n);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, n);
             }
             true
         }
@@ -675,20 +702,23 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
-            // (counted and logged at enqueue, `BcpackRefusals`).
-            (true, _) => {
-                if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
+            (zlib, mode) => {
+                if (zlib && self.intermediate_size != 0
+                    && (self.intermediate_size <= self.source_size || self.intermediate_size >= self.destination_size))
+                    || (!zlib && self.intermediate_size != 0)
+                {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
-            }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
-            (false, _) => {
-                if self.intermediate_size != 0 {
+                let block = bcpack::block_size(mode).ok_or(E_DECOMPRESSION)?;
+                let bytes = self.destination_size as usize;
+                if bytes == 0 || bytes > bcpack::MAX_OUTPUT || !bytes.is_multiple_of(block) {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if self.source_size == 0 || self.source_size as usize > bcpack::MAX_INPUT
+                    || self.intermediate_size as usize > bcpack::MAX_INPUT
+                {
+                    return Err(E_DECOMPRESSION);
+                }
             }
         }
         Ok(())
@@ -721,28 +751,32 @@ unsafe fn read_own(at: usize, out: *mut u8, len: usize) -> bool {
     at != 0 && ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out as *mut c_void, len, &mut done) != 0 && done == len
 }
 
-/// Whether `n` bytes at `p` are committed, writable memory.
-fn writable(p: usize, n: usize) -> bool {
-    let Some(end) = p.checked_add(n) else { return false };
+/// Validate a writable span and report whether every byte is private memory.
+fn writable_span(p: usize, n: usize) -> Option<bool> {
+    use windows_sys::Win32::System::Memory::MEM_PRIVATE;
+
+    let end = p.checked_add(n)?;
     crate::hle::kernelx::lazy::ensure(p, n);
     if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
-        return true;
+        return Some(false);
     }
     let mut at = p;
+    let mut private = true;
     while at < end {
-        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let mut m = MEMORY_BASIC_INFORMATION::default();
         if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
-            return false;
+            return None;
         }
         let rw = 0x04 | 0x08 | 0x40 | 0x80; // PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY
         if m.State != MEM_COMMIT || m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
-            return false;
+            return None;
         }
-        let Some(next) = (m.BaseAddress as usize).checked_add(m.RegionSize) else { return false };
-        if next <= at { return false; }
+        private &= m.Type == MEM_PRIVATE;
+        let next = (m.BaseAddress as usize).checked_add(m.RegionSize)?;
+        if next <= at { return None; }
         at = next;
     }
-    true
+    Some(private)
 }
 
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {
@@ -768,16 +802,31 @@ pub fn counters() -> (u64, u64, u64) {
     (REQUESTS.load(Ordering::Relaxed), BYTES.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed))
 }
 
-// Allocation failures on the request path become request errors rather than a Rust abort.
-fn zeroed_request_buffer(n: usize) -> Result<Vec<u8>, HRESULT> {
-    let mut b = Vec::new();
-    b.try_reserve_exact(n).map_err(|_| E_OUTOFMEMORY)?;
-    b.resize(n, 0);
-    Ok(b)
+// Reuse input staging on a queue's worker. Do not pin a one-off large allocation
+// for the rest of its lifetime. Every successful source read fills the entire slice.
+const RETAIN_INPUT_BYTES: usize = 8 << 20;
+
+#[derive(Default)]
+struct InputBuffer(Vec<u8>);
+
+impl InputBuffer {
+    fn prepare(&mut self, n: usize) -> Result<&mut [u8], HRESULT> {
+        if n > self.0.len() {
+            self.0.try_reserve_exact(n - self.0.len()).map_err(|_| E_OUTOFMEMORY)?;
+            self.0.resize(n, 0);
+        }
+        Ok(&mut self.0[..n])
+    }
+
+    fn trim(&mut self) {
+        if self.0.capacity() > RETAIN_INPUT_BYTES {
+            self.0 = Vec::new();
+        }
+    }
 }
 
 /// Run a request; the destination gets the bytes or nothing.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>, input: &mut InputBuffer) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -799,39 +848,78 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             );
         }
     }
-    if !r.dest_physical_pages() && !writable(r.destination as usize, n) {
-        return Err(E_ACCESS_VIOLATION);
-    }
-    let src: Vec<u8> = if r.memory_source() {
-        let mut b = zeroed_request_buffer(r.source_size as usize)?;
-        if r.source_physical_pages() {
-            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
-            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
-                return Err(E_ACCESS_VIOLATION);
-            }
-        } else {
-            if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
-                return Err(E_ACCESS_VIOLATION);
-            }
-            if !b.is_empty() {
-                std::ptr::copy_nonoverlapping(r.source as *const u8, b.as_mut_ptr(), b.len());
-            }
-        }
-        b
-    } else {
-        let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
-        let mut b = zeroed_request_buffer(r.source_size as usize)?;
-        read_exact_at(&f, r.offset, &mut b)?;
-        b
+    let destination = (!r.dest_physical_pages()).then(|| storage_address(r.destination as usize, n));
+    let source = (r.memory_source() && !r.source_physical_pages())
+        .then(|| storage_address(r.source as usize, r.source_size as usize));
+    let private_destination = match destination {
+        Some(addr) => writable_span(addr, n).ok_or(E_ACCESS_VIOLATION)?,
+        None => false,
     };
-
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    if r.swizzle() != 0 || (r.bcpack() != 0 && !bcpack::can_decode(r.bcpack())) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    if let (Some(src), Some(dst), 0, false) = (
+        source, destination.filter(|_| private_destination), r.bcpack(), r.zlib(),
+    ) {
+        if r.source_size as usize != n {
+            return Err(E_DESTINATION_SIZE);
+        }
+        if !crate::gpu::shader::readable(src, n) {
+            return Err(E_ACCESS_VIOLATION);
+        }
+        if n != 0 {
+            // Section-backed destinations can alias at different addresses. Keep their
+            // snapshot path. Here a virtual overlap can use memmove directly.
+            std::ptr::copy(src as *const u8, dst as *mut u8, n);
+        }
+        return Ok(());
+    }
+
+    let src = input.prepare(r.source_size as usize)?;
+    if r.memory_source() {
+        if r.source_physical_pages() {
+            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, src) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else {
+            let address = source.ok_or(E_ACCESS_VIOLATION)?;
+            if !crate::gpu::shader::readable(address, r.source_size as usize) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+            if !src.is_empty() {
+                std::ptr::copy_nonoverlapping(address as *const u8, src.as_mut_ptr(), src.len());
+            }
+        }
+    } else {
+        let f = file.and_then(|f| f.handle()).ok_or(E_FILE_HANDLE)?;
+        read_exact_at(&f, r.offset, src)?;
+    }
+
+    let decoded;
+    let payload: &[u8] = if r.bcpack() != 0 {
+        let inflated;
+        let packed: &[u8] = if r.zlib() {
+            let intermediate = r.intermediate_size as usize;
+            let limit = if intermediate == 0 { bcpack::MAX_INPUT } else { intermediate };
+            inflated = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, limit)
+                .map_err(|_| E_ZLIB_DATA)?;
+            if intermediate != 0 && inflated.len() != intermediate {
+                return Err(E_ZLIB_DATA);
+            }
+            &inflated
+        } else {
+            src
+        };
+        decoded = bcpack::decode(r.bcpack(), packed, n).map_err(|e| {
+            warn_once("BCPackDecode", format_args!("BCPack decode rejected: {e}"));
+            if matches!(e, bcpack::Error::Allocation) { E_OUTOFMEMORY } else { E_DECOMPRESSION }
+        })?;
+        &decoded
+    } else if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
-        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
+        let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
         if d.len() != stage1_len {
             return Err(E_ZLIB_DATA);
         }
@@ -839,7 +927,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             d.try_reserve_exact(n - d.len()).map_err(|_| E_OUTOFMEMORY)?;
             d.resize(n, 0);
         }
-        d
+        decoded = d;
+        &decoded
     } else {
         src
     };
@@ -865,7 +954,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
     } else if n > 0 {
-        std::ptr::copy_nonoverlapping(payload.as_ptr(), r.destination as *mut u8, n);
+        let address = destination.ok_or(E_ACCESS_VIOLATION)?;
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), address as *mut u8, n);
     }
     Ok(())
 }
@@ -1037,6 +1127,7 @@ impl QueueInner {
         let _active = ActiveGuard(self);
         // the first failure of the requests since the last status entry
         let mut since_status = S_OK;
+        let mut input = InputBuffer::default();
         for batch in rx {
             for e in batch {
                 if self.closed.load(Ordering::Acquire) {
@@ -1053,7 +1144,12 @@ impl QueueInner {
                             // Cancelled requests are skipped without affecting status or error record.
                             continue;
                         }
-                        if let Err(hr) = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) } {
+                        let result = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref(), &mut input) };
+                        input.trim();
+                        if let Err(hr) = result {
+                            if hr == E_DECOMPRESSION && req.bcpack() != 0 {
+                                log_bcpack_refusal(&req, BCPACK.note(&req));
+                            }
                             self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
                                 since_status = hr;
@@ -1463,9 +1559,42 @@ mod tests {
 
     #[test]
     fn request_buffer_handles_capacity_overflow_without_aborting() {
-        assert_eq!(zeroed_request_buffer(8), Ok(vec![0; 8]));
-        assert_eq!(zeroed_request_buffer(0), Ok(Vec::new()));
-        assert_eq!(zeroed_request_buffer(usize::MAX), Err(E_OUTOFMEMORY));
+        let mut input = InputBuffer::default();
+        assert_eq!(&*input.prepare(8).unwrap(), &[0; 8]);
+        assert!(input.prepare(0).unwrap().is_empty());
+        assert_eq!(input.prepare(usize::MAX), Err(E_OUTOFMEMORY));
+    }
+
+    #[test]
+    fn input_staging_reuses_small_buffers_and_drops_oversized_ones() {
+        let mut input = InputBuffer::default();
+        let ptr = input.prepare(4096).unwrap().as_ptr();
+        input.trim();
+        assert_eq!(input.prepare(1024).unwrap().as_ptr(), ptr);
+        assert_eq!(input.0.len(), 4096, "keep the initialized high-water mark");
+        assert_eq!(input.prepare(4096).unwrap().as_ptr(), ptr);
+        input.prepare(RETAIN_INPUT_BYTES + 1).unwrap();
+        input.trim();
+        assert_eq!(input.0.capacity(), 0);
+        assert_eq!(&*input.prepare(4).unwrap(), &[0; 4]);
+    }
+
+    #[test]
+    fn reused_input_staging_never_delivers_bytes_from_a_failed_read() {
+        let mut input = InputBuffer::default();
+        let source = [17u8; 32];
+        let next = [29u8; 16];
+        let mut dest = [0u8; 32];
+        let req = |src: u64, dst: u64, n: u32| Request::parse(&request(SOURCE_MEMORY_BIT, dst, n, src, 0, n));
+        unsafe {
+            assert_eq!(execute(&req(source.as_ptr() as u64, dest.as_mut_ptr() as u64, 32), None, None, None, &mut input), Ok(()));
+            assert_eq!(dest, source);
+            assert_eq!(execute(&req(1, dest.as_mut_ptr() as u64, 32), None, None, None, &mut input), Err(E_ACCESS_VIOLATION));
+            assert_eq!(dest, source);
+            assert_eq!(execute(&req(next.as_ptr() as u64, dest.as_mut_ptr() as u64, 16), None, None, None, &mut input), Ok(()));
+            assert_eq!(&dest[..16], &next);
+            assert_eq!(&dest[16..], &source[16..]);
+        }
     }
 
     #[test]
@@ -1490,6 +1619,100 @@ mod tests {
     }
 
     #[test]
+    fn storage_resolves_paired_gpu_views_without_overwriting_a_direct_mapping() {
+        use crate::hle::kernelx::mirrors;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree,
+            MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+
+        const PAGE: usize = 0x10000;
+        const SIZE: usize = 0x510000;
+        struct Reservation(usize);
+        impl Drop for Reservation {
+            fn drop(&mut self) {
+                mirrors::released(self.0);
+                unsafe { VirtualFree(self.0 as *mut c_void, 0, MEM_RELEASE) };
+            }
+        }
+        unsafe {
+            let cpu = Reservation(VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_READWRITE) as usize);
+            let gpu = Reservation(VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS) as usize);
+            assert!(cpu.0 != 0 && gpu.0 != 0);
+            mirrors::reserved(cpu.0, SIZE, 0x2040_2000, PAGE_READWRITE);
+            mirrors::reserved(gpu.0, SIZE, 0x2040_2000, 0x801);
+            assert_eq!(VirtualAlloc(cpu.0 as *const c_void, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, cpu.0);
+
+            let source = cpu.0 as *mut u8;
+            let target = (cpu.0 + PAGE) as *const u8;
+            let expected = b"paired view";
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), source, expected.len());
+            let bytes = expected.len() as u32;
+            let r = Request::parse(&request(SOURCE_MEMORY_BIT, (gpu.0 + PAGE) as u64,
+                bytes, gpu.0 as u64, 0, bytes));
+            let mut input = InputBuffer::default();
+            assert_eq!(execute(&r, None, None, None, &mut input), Ok(()));
+            assert_eq!(std::slice::from_raw_parts(target, expected.len()), expected);
+
+            let direct = gpu.0 + PAGE;
+            assert_eq!(VirtualAlloc(direct as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, direct);
+            (target as *mut u8).write(0xCD);
+            assert_eq!(storage_address(direct, 1), direct);
+            assert_eq!(storage_address(direct - 1, 2), direct - 1);
+            assert_eq!(storage_address(gpu.0 + SIZE - 1, 2), gpu.0 + SIZE - 1);
+            assert_eq!(execute(&r, None, None, None, &mut input), Ok(()));
+            assert_eq!(std::slice::from_raw_parts(direct as *const u8, expected.len()), expected);
+            assert_eq!(target.read(), 0xCD);
+        }
+    }
+
+    #[test]
+    fn plain_memory_request_copies_overlapping_ranges_without_staging() {
+        let mut bytes = *b"abcdefgh";
+        let src = bytes.as_mut_ptr();
+        let mut input = InputBuffer(Vec::new());
+        unsafe {
+            let r = Request::parse(&request(SOURCE_MEMORY_BIT, src.add(2) as u64, 6, src as u64, 0, 6));
+            assert_eq!(r.check(true), Ok(()));
+            assert_eq!(execute(&r, None, None, None, &mut input), Ok(()));
+        }
+        assert_eq!(&bytes, b"ababcdef");
+        assert_eq!(input.0.capacity(), 0);
+    }
+
+    #[test]
+    fn plain_memory_request_stages_overlapping_section_views() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, MapViewOfFile,
+            UnmapViewOfFile, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE};
+
+        struct View(MEMORY_MAPPED_VIEW_ADDRESS);
+        impl Drop for View {
+            fn drop(&mut self) {
+                unsafe { UnmapViewOfFile(self.0) };
+            }
+        }
+        unsafe {
+            let mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+                PAGE_READWRITE, 0, 4096, std::ptr::null());
+            assert!(!mapping.is_null());
+            let source = View(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 4096));
+            let destination = View(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 4096));
+            CloseHandle(mapping);
+            assert!(!source.0.Value.is_null() && !destination.0.Value.is_null());
+            let src = source.0.Value as *mut u8;
+            let dst = destination.0.Value as *mut u8;
+            assert_ne!(src, dst);
+            let bytes = b"abcdefgh";
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), src, bytes.len());
+            let request = Request::parse(&request(SOURCE_MEMORY_BIT, dst.add(2) as u64, 6,
+                src as u64, 0, 6));
+            let mut input = InputBuffer::default();
+            assert_eq!(execute(&request, None, None, None, &mut input), Ok(()));
+            assert_eq!(std::slice::from_raw_parts(dst, bytes.len()), b"ababcdef");
+            assert_eq!(&input.0[..6], b"abcdef");
+        }
+    }
+
+    #[test]
     fn requests_are_checked_like_the_console() {
         let ok = Request::parse(&request(0, 0x1000, 64, 0x2000, 0, 64));
         assert_eq!(ok.check(false), Ok(()));
@@ -1497,7 +1720,7 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack");
+        assert_eq!(Request::parse(&request(5, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BC2 BCPack");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1722,12 +1945,12 @@ mod tests {
         // Zlib only with invalid intermediate_size (<= src or > dst)
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION, invalid intermediate -> E_DESTINATION_SIZE
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        // Two-stage zlib + BCPack: valid sizes are accepted for supported modes
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION
-        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        // Single-stage BCPack: intermediate must be 0
+        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
         assert_eq!(Request::parse(&request_ex(swiz, 0x1000, 0, 64, 0x2000, 0, 64, 0, 0)).check(false), Err(E_DECOMPRESSION));
@@ -2279,24 +2502,80 @@ mod tests {
     }
 
     #[test]
+    fn bc1_requests_decode_directly_or_after_zlib_and_commit_only_complete_output() {
+        const OUTPUT: usize = 65536;
+        let packed = include_bytes!("../../../../tests/data/bcpack/bc1-8192-3.bin").as_slice();
+        let zipped = miniz_oxide::deflate::compress_to_vec_zlib(packed, 6);
+        let mut dest = vec![0xCDu8; OUTPUT + 16];
+        let mut desc = [0u8; 0x18];
+        desc[0] = 1;
+        desc[8] = 8;
+        desc[10] = 2;
+        let mut q = std::ptr::null_mut();
+        let mut status = std::ptr::null_mut();
+        unsafe {
+            assert_eq!(factory_create_queue(std::ptr::null_mut(), desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            assert_eq!(factory_create_status_array(std::ptr::null_mut(), 5, std::ptr::null(),
+                &IID_STATUS_ARRAY, &mut status), S_OK);
+        }
+        let mode = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
+        for (index, (options, src, intermediate, expected)) in [
+            (mode, packed, 0, S_OK),
+            (mode | ZLIB_BIT, zipped.as_slice(), packed.len() as u32, S_OK),
+            (mode | ZLIB_BIT, zipped.as_slice(), 0, S_OK),
+            (mode, &packed[..1], 0, E_DECOMPRESSION),
+            (mode | ZLIB_BIT, zipped.as_slice(), packed.len() as u32 + 1, E_ZLIB_DATA),
+        ].into_iter().enumerate() {
+            dest.fill(0xCD);
+            let request = request_ex(options, dest.as_mut_ptr() as u64, 0, OUTPUT as u32,
+                src.as_ptr() as u64, 0, src.len() as u32, intermediate, 0);
+            assert_eq!(Request::parse(&request).check(true), Ok(()));
+            let index = index as u32;
+            unsafe {
+                queue_enqueue_request(q, request.as_ptr());
+                queue_enqueue_status(q, status, index);
+                queue_submit(q);
+                let start = std::time::Instant::now();
+                while !status_is_complete(status, index) && start.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                if !status_is_complete(status, index) {
+                    queue_close(q);
+                    panic!("BC1 queue status did not complete");
+                }
+                assert_eq!(status_get_hresult(status, index), expected);
+            }
+            if expected == S_OK {
+                for (block, got) in dest[..OUTPUT].chunks_exact(8).enumerate() {
+                    assert_eq!(got, bcpack::synthetic_bc1_block(block), "block {block}");
+                }
+            } else {
+                assert!(dest[..OUTPUT].iter().all(|&byte| byte == 0xCD));
+            }
+            assert_eq!(&dest[OUTPUT..], &[0xCD; 16]);
+        }
+        unsafe {
+            queue_close(q);
+            queue_release(q);
+            status_release(status);
+        }
+    }
+
+    #[test]
     fn bcpack_refusals_are_counted_per_mode_and_still_fail() {
         let counts = BcpackRefusals::new();
-        let bc7 = Request::parse(&request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
-        let bc7_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
-        let bc1 = Request::parse(&request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
-        for (i, r) in [&bc7, &bc7_zlib, &bc1, &bc7].into_iter().enumerate() {
-            assert_eq!(r.check(true), Err(E_DECOMPRESSION), "the request fails as before");
+        let bc2 = Request::parse(&request(SOURCE_MEMORY_BIT | 2 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
+        let bc2_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 2 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
+        let unknown = Request::parse(&request(SOURCE_MEMORY_BIT | 8 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
+        for (i, r) in [&bc2, &bc2_zlib, &unknown, &bc2].into_iter().enumerate() {
+            assert_eq!(r.check(true), Err(E_DECOMPRESSION));
             assert_eq!(counts.note(r), i as u64 + 1);
         }
         let s = counts.stats();
-        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC1", "BC7"]);
-        assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
-        assert_eq!((s["BC1"].requests, s["BC1"].with_zlib, s["BC1"].destination_bytes), (1, 0, 0x8000));
-        assert_eq!(counts.summary(), "BC1 1 (32768 bytes), BC7 3 (196608 bytes)");
-        for m in 1..=7u64 {
-            let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
-            assert_eq!(r.check(true), Err(E_DECOMPRESSION));
-        }
+        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC2", "mode 8"]);
+        assert_eq!((s["BC2"].requests, s["BC2"].with_zlib, s["BC2"].destination_bytes), (3, 1, 0x30000));
+        assert_eq!((s["mode 8"].requests, s["mode 8"].with_zlib, s["mode 8"].destination_bytes), (1, 0, 0x8000));
+        assert_eq!(counts.summary(), "BC2 3 (196608 bytes), mode 8 1 (32768 bytes)");
     }
 
     #[test]
@@ -2324,7 +2603,7 @@ mod tests {
             let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
             let packed = [0x5Au8; 64];
             let run = |dst: &mut [u8], n: u32, index: u32| {
-                let r = request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
+                let r = request(SOURCE_MEMORY_BIT | 2 << BCPACK_SHIFT, dst.as_mut_ptr() as u64, n, packed.as_ptr() as u64, 0, packed.len() as u32);
                 enqueue(q, r.as_ptr());
                 status(q, s, index);
                 submit(q);
@@ -2334,7 +2613,7 @@ mod tests {
                 }
                 hresult(s, index)
             };
-            // a BC7 destination of 0x1008 bytes (a part block at the end), then guard bytes
+            // a BC2 destination of 0x1008 bytes (a part block at the end), then guard bytes
             let n = 0x1008usize;
             let mut dst = vec![0xCDu8; n + 64];
             assert!(!queue(q).bcpack_fill.load(Ordering::Relaxed), "off unless XCL_DSTORAGE_BCPACK_FILL is set");
@@ -2342,12 +2621,12 @@ mod tests {
             assert!(dst.iter().all(|&b| b == 0xCD), "without the switch the destination is left as it was");
 
             queue(q).bcpack_fill.store(true, Ordering::Relaxed);
-            let before = BCPACK.filled_bytes[7].load(Ordering::Relaxed);
+            let before = BCPACK.filled_bytes[2].load(Ordering::Relaxed);
             assert_eq!(run(&mut dst, n as u32, 1), E_DECOMPRESSION, "the fill does not change the status");
-            let block = bcpack_fill_block(7).unwrap();
-            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC7 blocks up to the destination size");
+            let block = bcpack_fill_block(2).unwrap();
+            assert!(dst[..n].chunks(16).all(|c| c == &block[..c.len()]), "solid BC2 blocks up to the destination size");
             assert!(dst[n..].iter().all(|&b| b == 0xCD), "nothing past the destination size");
-            assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
+            assert!(BCPACK.filled_bytes[2].load(Ordering::Relaxed) >= before + n as u64);
             queue_close(q);
             queue_release(q);
             status_release(s);

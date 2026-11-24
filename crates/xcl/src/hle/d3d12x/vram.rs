@@ -34,6 +34,7 @@ use crate::util::HRESULT;
 
 /// A heap of video memory for placements at title addresses `[base, base + size)`.
 struct Arena<H> {
+    device: usize,
     base: usize,
     size: usize,
     /// the heap's alignment (a placement that needs more does not go in)
@@ -65,13 +66,13 @@ impl<H: Clone> Arenas<H> {
     /// Where a placement of `bytes` at `va` (alignment `align`) goes: the newest arena holding
     /// it at an offset `align` allows, else a new arena of its size, `make(size, align)`.
     /// (heap, offset, arena id); None: no heap.
-    fn take(&mut self, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
+    fn take(&mut self, device: usize, va: usize, bytes: usize, align: usize, now: std::time::Instant, make: impl FnOnce(usize, usize) -> Option<H>) -> Option<(H, usize, u64)> {
         self.sweep(now);
         if align == 0 || bytes == 0 {
             return None;
         }
         let end = va.checked_add(bytes)?;
-        let fits = |a: &Arena<H>| a.align >= align && a.base <= va
+        let fits = |a: &Arena<H>| a.device == device && a.align >= align && a.base <= va
             && a.base.checked_add(a.size).is_some_and(|limit| end <= limit)
             && (va - a.base) % align == 0;
         let i = match self.list.iter().rposition(fits) {
@@ -81,7 +82,7 @@ impl<H: Clone> Arenas<H> {
                 va.checked_add(size)?;
                 let heap = make(size, align)?;
                 self.next_id += 1;
-                self.list.push(Arena { base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
+                self.list.push(Arena { device, base: va, size, align, heap, users: 0, idle_since: None, id: self.next_id });
                 self.list.len() - 1
             }
         };
@@ -744,7 +745,7 @@ pub unsafe fn place(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_DESC, st
     }
     let align = (info.Alignment as usize).max(PAGE);
     let now = std::time::Instant::now();
-    let (heap, offset, id) = ARENAS.lock().unwrap().take(va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
+    let (heap, offset, id) = ARENAS.lock().unwrap().take(dev.as_raw() as usize, va, info.SizeInBytes as usize, align, now, |size, align| arena_heap(dev, va, size, align))?;
     let hr = super::real::dev_create_placed_resource(this, heap.as_raw() as usize, offset, desc as *const _ as usize, state as usize, clear as usize, riid, ppv);
     if hr < 0 || (*ppv).is_null() {
         ARENAS.lock().unwrap().release(id, now);
@@ -880,9 +881,9 @@ mod tests {
     fn invalid_texture_ranges_do_not_allocate() {
         let mut a = Arenas::<u32>::new();
         let now = Instant::now();
-        assert!(a.take(usize::MAX - 10, 20, PAGE, now, |_, _| panic!("overflow")).is_none());
-        assert!(a.take(0, 20, 0, now, |_, _| panic!("zero alignment")).is_none());
-        assert!(a.take(0, usize::MAX, PAGE, now, |_, _| panic!("rounding overflow")).is_none());
+        assert!(a.take(0, usize::MAX - 10, 20, PAGE, now, |_, _| panic!("overflow")).is_none());
+        assert!(a.take(0, 0, 20, 0, now, |_, _| panic!("zero alignment")).is_none());
+        assert!(a.take(0, 0, usize::MAX, PAGE, now, |_, _| panic!("rounding overflow")).is_none());
         assert!(owned_pages(usize::MAX - PAGE, Some((2 * PAGE) as u64), 4).is_none());
         assert!(owned_pages(0, None, usize::MAX).is_none());
         assert!(a.list.is_empty());
@@ -891,7 +892,7 @@ mod tests {
     /// A placement's arena id, with heaps numbered as they are made.
     fn take(a: &mut Arenas<u32>, va: usize, bytes: usize, align: usize, now: Instant) -> u64 {
         let n = a.list.len() as u32;
-        a.take(va, bytes, align, now, |_, _| Some(n)).unwrap().2
+        a.take(0, va, bytes, align, now, |_, _| Some(n)).unwrap().2
     }
 
     #[test]
@@ -910,6 +911,19 @@ mod tests {
         assert_eq!(a.bytes(), (70 + 70 + 8) * MIB);
         // the newest arena holding an address is the one placements there share
         assert_eq!(take(&mut a, a0 + 64 * MIB, 4 * MIB, PAGE, t), straddle);
+    }
+
+    #[test]
+    fn arenas_are_not_shared_between_devices() {
+        let mut a = Arenas::<u32>::new();
+        let t = Instant::now();
+        let va = 0x10000;
+        let (h1, _, id1) = a.take(1, va, PAGE, PAGE, t, |_, _| Some(11)).unwrap();
+        let (h2, _, id2) = a.take(2, va, PAGE, PAGE, t, |_, _| Some(22)).unwrap();
+        assert_eq!((h1, h2), (11, 22));
+        assert_ne!(id1, id2);
+        assert_eq!(a.take(1, va, PAGE, PAGE, t, |_, _| panic!("already allocated")).unwrap().2, id1);
+        assert_eq!(a.bytes(), 2 * PAGE);
     }
 
     #[test]

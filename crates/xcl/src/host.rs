@@ -101,6 +101,14 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 crate::log::detail(format_args!("{memory}"));
                 let (heaps, free, cooling, idle, targets, candidates, blocked) = crate::hle::d3d12x::vram::pool_diagnostics();
                 crate::log::detail(format_args!("texture_pool heap_count={heaps} free_tiles={free} cooling_tiles={cooling} idle_queue_entries={idle} tracked_targets={targets} fully_recyclable_pool_candidates={candidates} mapping_fence_blocked_tiles={blocked} tile_bytes=65536"));
+                let made = crate::hle::d3d12x::real::made_cache_count();
+                let queues = crate::hle::d3d12x::present::queue_count();
+                let release = crate::hle::d3d12x::late_release_diagnostics();
+                let sparse = crate::hle::d3d12x::sparse::pool_diagnostics();
+                crate::log::detail(format_args!("resource_lifetime made_entries={made:?} retained_title_queues={queues:?} late_release=(open_resources,sealed_resources,batches,queue_fences):{release:?}"));
+                crate::log::detail(format_args!("sparse_pool (active_pools,retired_pools,mapped_tiles,pinned_tiles,free_tiles,ring_inflight_bytes,transfer_failed)={sparse:?}"));
+                let bcpack = crate::hle::dstorage::stats();
+                crate::log::detail(format_args!("bcpack_refused={:?}", bcpack.bcpack_refused));
                 if activity {
                     // Keep the legacy smoke.ps1 format for a successful measurement.
                     if let Some(private) = private {

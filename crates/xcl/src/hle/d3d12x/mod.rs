@@ -20,6 +20,10 @@ mod fence_x;
 pub mod frame;
 pub mod guard;
 mod late_release;
+
+pub(crate) fn late_release_diagnostics() -> Option<(usize, usize, usize, usize)> {
+    late_release::diagnostic_counts()
+}
 pub mod layout;
 pub mod list_x;
 pub mod null;

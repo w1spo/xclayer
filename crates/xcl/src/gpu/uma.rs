@@ -107,13 +107,25 @@ fn take_sparse_in(
     Some(at)
 }
 
+/// Size one coherent window without overflowing before the hardware cap is applied.
+fn window_size(size: usize) -> usize {
+    size.clamp(GRAIN, MAX_SIZE).next_multiple_of(GRAIN)
+}
+
+/// A committed-only layout must hold the requested total; never silently wrap or truncate it.
+fn committed_layout(size: usize) -> Option<(usize, usize)> {
+    let total = size.max(GRAIN).checked_next_multiple_of(GRAIN)?;
+    if total > MAX_WINDOWS * MAX_SIZE { return None; }
+    let n = total.div_ceil(MAX_SIZE);
+    Some((n, window_size(total.div_ceil(n))))
+}
+
 impl Uma {
     /// Commit `size` bytes (split into as few equal windows as fit, at most 4) at the first
     /// free 16 GiB-aligned address from 16 GiB up, with remaining windows reserved as sparse.
     pub fn new(size: usize) -> Option<Uma> {
-        let size = ((size + GRAIN - 1) & !(GRAIN - 1)).max(GRAIN);
-        let n = size.div_ceil(MAX_SIZE).clamp(1, MAX_WINDOWS);
-        let mut u = Uma::with_windows(n, (size.div_ceil(n) + GRAIN - 1) & !(GRAIN - 1))?;
+        let (n, per_window) = committed_layout(size)?;
+        let mut u = Uma::with_windows(n, per_window)?;
         u.reserve_sparse_windows();
         u.reserve_pool(POOL);
         Some(u)
@@ -167,7 +179,7 @@ impl Uma {
 
     /// `for_runtime` with a coherent window of up to `coherent` bytes (`coherent_hint`).
     pub fn for_runtime_with(size: usize, coherent: usize) -> Option<Uma> {
-        let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
+        let committed = window_size(size.min(coherent.max(RUNTIME_COMMITTED_CAP)));
         let sparse_len = (MAX_WINDOWS - 1) * WINDOW;
         for slot in (4usize..512).step_by(MAX_WINDOWS) {
             let base = slot << 32;
@@ -374,7 +386,7 @@ impl Uma {
 
     /// `windows` committed windows of `size` bytes each.
     pub fn with_windows(windows: usize, size: usize) -> Option<Uma> {
-        let size = ((size + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
+        let size = window_size(size);
         let windows = windows.clamp(1, MAX_WINDOWS);
         for slot in (4usize..512).step_by(MAX_WINDOWS) {
             let base = slot << 32;
@@ -699,7 +711,7 @@ fn coherent_file() -> std::path::PathBuf {
 /// Bytes the coherent window is made with.
 pub fn coherent_hint() -> usize {
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-        return (mb << 20).clamp(GRAIN, MAX_SIZE);
+        return mb.saturating_mul(1 << 20).clamp(GRAIN, MAX_SIZE);
     }
     let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
@@ -714,7 +726,7 @@ pub fn coherent_hint() -> usize {
         );
         return RUNTIME_COMMITTED_CAP;
     }
-    (title + RUNTIME_COMMITTED_CAP).min(MAX_SIZE)
+    title.saturating_add(RUNTIME_COMMITTED_CAP).min(MAX_SIZE)
 }
 
 /// Commit free before the title starts for its GPU heaps to go to the coherent window.
@@ -741,7 +753,7 @@ pub fn note_coherent_need(bytes: usize) {
             let _ = std::fs::create_dir_all(d);
         }
         let _ = std::fs::write(&f, bytes.to_string());
-        crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (a window of up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(MAX_SIZE) >> 20);
+        crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (a window of up to {} MB from the next run)", bytes >> 20, bytes.saturating_add(RUNTIME_COMMITTED_CAP).min(MAX_SIZE) >> 20);
     }
 }
 
@@ -758,7 +770,7 @@ pub fn get() -> Option<&'static Uma> {
         .get_or_init(|| {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
             let coherent = coherent_hint();
-            let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
+            let u = mb.checked_mul(1 << 20).and_then(|bytes| Uma::for_runtime_with(bytes.max(coherent), coherent));
             match &u {
                 Some(u) => {
                     let sparse_n = (0..MAX_WINDOWS).filter(|&k| u.is_sparse_window(k)).count();
@@ -780,6 +792,21 @@ pub fn get() -> Option<&'static Uma> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn committed_layout_does_not_wrap_or_truncate_large_sizes() {
+        assert_eq!(window_size(0), GRAIN);
+        assert_eq!(window_size(usize::MAX), MAX_SIZE);
+        assert_eq!(committed_layout(0), Some((1, GRAIN)));
+        assert_eq!(committed_layout(MAX_SIZE), Some((1, MAX_SIZE)));
+        let (n, per) = committed_layout(MAX_SIZE + 1).unwrap();
+        assert_eq!(n, 2);
+        assert!(n * per > MAX_SIZE);
+        assert_eq!(per % GRAIN, 0);
+        assert_eq!(committed_layout(MAX_WINDOWS * MAX_SIZE), Some((MAX_WINDOWS, MAX_SIZE)));
+        assert_eq!(committed_layout(MAX_WINDOWS * MAX_SIZE + 1), None);
+        assert_eq!(committed_layout(usize::MAX), None);
+    }
 
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.

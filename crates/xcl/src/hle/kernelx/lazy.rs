@@ -105,8 +105,19 @@ pub fn ensure(p: usize, len: usize) {
         }
         g.range(p & !(PAGE - 1)..p.saturating_add(len)).copied().collect()
     };
-    for page in pages {
-        unsafe { commit(page) };
+    // Do not reacquire the write lock for every page of a large file buffer.
+    // Bound each lock hold to avoid monopolising the fault handler.
+    for chunk in pages.chunks(64) {
+        let mut g = LAZY.write().unwrap_or_else(|e| e.into_inner());
+        commit_marked_pages(&mut g, chunk, |page| unsafe {
+            !VirtualAlloc(page as *const c_void, PAGE, MEM_COMMIT, PAGE_READWRITE).is_null()
+        });
+    }
+}
+
+fn commit_marked_pages(g: &mut BTreeSet<usize>, pages: &[usize], mut allocate: impl FnMut(usize) -> bool) {
+    for &page in pages {
+        commit_marked(g, page, || allocate(page));
     }
 }
 
@@ -144,6 +155,18 @@ mod tests {
         assert!(pages.contains(&page));
         assert!(commit_marked(&mut pages, page, || true));
         assert!(!pages.contains(&page));
+    }
+
+    #[test]
+    fn batched_ensure_keeps_failures_and_skips_unmarked_pages() {
+        let mut pages = BTreeSet::from([PAGE, 2 * PAGE, 4 * PAGE]);
+        let mut attempted = Vec::new();
+        commit_marked_pages(&mut pages, &[PAGE, 2 * PAGE, 3 * PAGE], |page| {
+            attempted.push(page);
+            page != 2 * PAGE
+        });
+        assert_eq!(attempted, vec![PAGE, 2 * PAGE]);
+        assert_eq!(pages, BTreeSet::from([2 * PAGE, 4 * PAGE]));
     }
 
     #[test]

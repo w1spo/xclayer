@@ -31,7 +31,7 @@ struct Pending {
 
 impl Pending {
     fn note_use(&self) {
-        if self.key != 0 && !self.used.swap(true, Ordering::Relaxed) {
+        if self.key != 0 && !self.used.load(Ordering::Relaxed) && !self.used.swap(true, Ordering::Relaxed) {
             used::note(self.key);
         }
     }
@@ -353,6 +353,10 @@ fn entry(pso: usize) -> Option<Arc<Pending>> {
 /// The pipeline to use for `pso` now: the real one once built, else `pso` itself.
 pub fn resolve(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_entry(pso, p)
+}
+
+fn resolve_entry(pso: usize, p: Arc<Pending>) -> usize {
     p.note_use();
     match p.real.load(Ordering::Acquire) {
         0 => {
@@ -370,10 +374,18 @@ pub fn resolve(pso: usize) -> usize {
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
     let Some(p) = entry(pso) else { return pso };
+    resolve_wait_entry(pso, &p)
+}
+
+fn resolve_wait_entry(pso: usize, p: &Pending) -> usize {
     p.note_use();
+    // complete() publishes the successful pipeline with Release ordering.
+    // A ready pipeline need not take either of the build/wait mutexes again.
+    let real = p.real.load(Ordering::Acquire);
+    if real != 0 { return real; }
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     let mut done = p.done.lock().unwrap();
     while !*done {
@@ -388,8 +400,8 @@ pub fn resolve_wait(pso: usize) -> usize {
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
-        Some(p) if p.compute => resolve_wait(pso),
-        Some(_) => resolve(pso),
+        Some(p) if p.compute => resolve_wait_entry(pso, &p),
+        Some(p) => resolve_entry(pso, p),
         None => pso,
     }
 }
@@ -433,6 +445,26 @@ mod queue_failure_tests {
             cv: Condvar::new(), compute: false, key: 0,
             used: Default::default(), orphan: Default::default(),
         }
+    }
+
+    #[test]
+    fn ready_compute_bind_does_not_wait_for_build_mutexes() {
+        let p = Arc::new(pending(Box::new(|| 0)));
+        let _job = p.job.lock().unwrap().take();
+        // Synthetic nonzero result; never passed to COM.
+        p.real.store(123, Ordering::Release);
+        *p.done.lock().unwrap() = true;
+        let job_guard = p.job.lock().unwrap();
+        let done_guard = p.done.lock().unwrap();
+        let worker_p = Arc::clone(&p);
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || tx.send(resolve_wait_entry(456, &worker_p)).unwrap());
+        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        // Release before joining even on regression, so the test cannot deadlock.
+        drop(done_guard);
+        drop(job_guard);
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), 123);
     }
 
     #[test]

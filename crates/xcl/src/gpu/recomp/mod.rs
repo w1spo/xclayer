@@ -307,8 +307,13 @@ pub fn ranked(sig: &[SigElement], with_clip: bool) -> Vec<&SigElement> {
 /// the distinct registers of `ranked(sig, with_clip)` (for unpacked signatures: one per element,
 /// as before).
 pub fn param_registers(sig: &[SigElement], with_clip: bool) -> Vec<u32> {
+    registers_ranked(&ranked(sig, with_clip))
+}
+
+/// Distinct registers in an already-ranked signature, including clip-distance ordering.
+fn registers_ranked(elements: &[&SigElement]) -> Vec<u32> {
     let mut regs = Vec::new();
-    for e in ranked(sig, with_clip) {
+    for e in elements {
         if !regs.contains(&e.register) {
             regs.push(e.register);
         }
@@ -318,7 +323,11 @@ pub fn param_registers(sig: &[SigElement], with_clip: bool) -> Vec<u32> {
 
 /// The elements (places in `ranked(sig, with_clip)`) at signature register `register`.
 pub fn elements_at(sig: &[SigElement], with_clip: bool, register: u32) -> Vec<usize> {
-    ranked(sig, with_clip).iter().enumerate().filter(|(_, e)| e.register == register).map(|(j, _)| j).collect()
+    elements_at_ranked(&ranked(sig, with_clip), register)
+}
+
+fn elements_at_ranked(elements: &[&SigElement], register: u32) -> Vec<usize> {
+    elements.iter().enumerate().filter(|(_, e)| e.register == register).map(|(j, _)| j).collect()
 }
 
 /// FSSM sub-version (+0x10): 5 in Fortnite's GDK; 6 in XDefiant's and Minecraft's, which has 8
@@ -397,17 +406,21 @@ pub fn ps_attribute_register(ps: &PsInterface, attr: usize) -> Option<u32> {
 /// The place in `ranked(inputs, false)` (the PC input struct's a0, a1 …) to read channel `chan`
 /// of attribute `attr` from: an element at its register (the one declaring `chan`, if any).
 pub fn ps_attribute_slot(ps: &PsInterface, attr: usize, chan: usize) -> Option<usize> {
-    let r = ps_attribute_register(ps, attr)?;
     let all = ranked(&ps.inputs, false);
+    let r = match &ps.attrs {
+        Some(t) => t.get(attr).map(|a| a.register as u32),
+        None => registers_ranked(&all).get(attr).copied(),
+    }?;
     all.iter().position(|e| e.register == r && e.mask >> chan & 1 == 1).or_else(|| all.iter().position(|e| e.register == r))
 }
 
 /// The attribute the input at `slot` of `ranked(inputs, false)` belongs to (None: not read).
 pub fn ps_slot_attribute(ps: &PsInterface, slot: usize) -> Option<usize> {
-    let r = ranked(&ps.inputs, false).get(slot)?.register;
+    let all = ranked(&ps.inputs, false);
+    let r = all.get(slot)?.register;
     match &ps.attrs {
         Some(t) => t.iter().position(|a| a.register as u32 == r),
-        None => param_registers(&ps.inputs, false).iter().position(|&x| x == r),
+        None => registers_ranked(&all).iter().position(|&x| x == r),
     }
 }
 
@@ -1414,6 +1427,21 @@ mod attribute_tests {
 
     fn input(name: &str, index: u32, register: u32, rw_mask: u8) -> SigElement {
         SigElement { name: name.into(), index, system_value: 0, component_type: 3, register, mask: 0xF, rw_mask, stream: 0 }
+    }
+
+    #[test]
+    fn ranked_lookup_preserves_packed_and_clip_register_order() {
+        let mut clip = input("SV_ClipDistance", 0, 1, 0xF);
+        clip.system_value = 2;
+        let mut clip2 = input("SV_ClipDistance", 1, 0, 0xF);
+        clip2.system_value = 2;
+        let sig = vec![clip, input("UV", 1, 5, 3), input("UV", 0, 5, 0xC),
+            input("COLOR", 0, 1, 0xF), clip2];
+        let all = ranked(&sig, true);
+        assert_eq!(registers_ranked(&all), [1, 5, 0]);
+        assert_eq!(elements_at_ranked(&all, 1), [0, 4]);
+        assert_eq!(elements_at_ranked(&all, 5), [1, 2]);
+        assert_eq!(elements_at_ranked(&all, 99), Vec::<usize>::new());
     }
 
     /// Fortnite's Slate PS (FSSM sub-version 5): attr0 = COLOR0, attr1 = TEXCOORD1; the table's
