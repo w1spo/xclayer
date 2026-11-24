@@ -1,192 +1,161 @@
-# XCL – Xbox Series X|S → Windows compatibility layer
+# XCLayer
 
-[![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/xcl)
-**Discord: <https://discord.gg/xcl>**
+**Xbox Series X|S compatibility layer for Windows.**
 
-XCL runs Xbox Series X|S (GDK) game files on a Windows PC **without CPU emulation**: the game's
-x64 code runs natively and XCL stands in for the console libraries the PC does not have
-(`kernelx.dll`, XGameRuntime, `d3d12_xs.dll`, …) – in the spirit of Wine/Proton. The console's
-GPU code (RDNA2 machine code) is recompiled into PC shaders (HLSL → DXIL).
+XCLayer is a fork of [XCL](https://github.com/ivall/xcl) that enables compatible Xbox Series X|S GDK applications to run on Windows. Game x64 code executes natively, while console-specific system libraries and graphics interfaces are translated to their Windows equivalents. RDNA2 shaders are recompiled to HLSL and DXIL for Direct3D 12.
 
-**Project state:** retail games run – Minecraft Preview and Unicorn Overlord are fully
-playable, Fortnite and XDefiant work as far as each game goes without its online services;
-see [Games](#games). The foundation is tested against real data from retail games
-(shader packs, texture archives, movies and the console DLLs they ship). Details, measurements and
-next steps:
-[`HANDOFF.md`](HANDOFF.md); design: [`docs/specs/2026-11-20-xcl-design.md`](docs/specs/2026-11-20-xcl-design.md).
+The fork focuses on stability, memory management, shader translation and runtime performance. Compatibility remains experimental; support varies by title, GPU and driver.
 
-## Games
+[Upstream project](https://github.com/ivall/xcl) · [Upstream Discord](https://discord.gg/xcl) · [Issues](https://github.com/w1spo/xclayer/issues) · [Builds](https://github.com/w1spo/xclayer/actions)
 
-| Game | Package (version) | State | What works | Limits |
-|---|---|---|---|---|
-| **Minecraft Preview** | `Microsoft.MinecraftBeta` 1.18.3064.0 | ✅ | fully playable | – |
-| **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
-| **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
-| **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
+## Requirements
 
-## Highlights
+| Component | Requirement |
+| --- | --- |
+| Operating system | Windows 10 22H2 (KB5029331 or later), or Windows 11, x64 |
+| Graphics | Direct3D 12 GPU with Shader Model 6.6 and mesh shader support |
+| Drivers | Current graphics drivers supporting the required D3D12 features |
+| Runtime | Windows Gaming Services (`xgameruntime.dll`) |
+| Shader compiler | DXC 1.8 or newer recommended |
+| Memory | Sufficient RAM, disk space and system-managed page file for the title |
 
-- **100 % of a retail game's shaders translate** – all 26 698 RDNA2 programs (26 503 records) of its shader pack
-  become HLSL; random samples compile to DXIL with 0 errors.
-- **The game's own console DLLs run on the PC** – its Bink 2 video codec decodes the game's
-  movies, its ray-tracing BVH builder builds acceleration structures on a PC GPU, the AMD FSR 4
-  console upscaler runs a whole frame on a PC GPU, the GDK HTTP library initialises.
-- **Console textures decode exactly** – the GFX10 tiling and mip layout reproduce 909 of 912
-  textures of the game's texture archive byte for byte, its volume textures included.
-- **370+ automated tests**, including GPU tests that compare translated shaders against expected
-  results instruction by instruction.
+AMD RDNA hardware is the primary development target upstream. NVIDIA GPUs use a Wave64-to-Wave32 translation path where applicable, which can affect performance and correctness. Hardware support does not guarantee game compatibility.
 
-## What works
+## Installation
 
-✅ done and verified
+### 1. Install the prerequisites
 
-### Running the game's code
+Install the following tools to build XCLayer from source:
 
-| Feature | State | What it does | Verified by |
-|---|---|---|---|
-| **PE loader** | ✅ | relocations, imports by name / ordinal / delay-load, TLS callbacks, exception tables, game DLLs, data-driven import routing (HLE / Windows / stub) | the game's 16 console DLLs load with 0 unresolved imports |
-| **kernelx** | ✅ | title memory (budget from MicrosoftGame.Config, physical pages), threads on the PC's processors, modules, OS / console info | unit + end-to-end tests |
-| **Memory** | ✅ | title graphics memory shared by CPU and GPU without copies, up to 16 GB (4 GiB windows) | GPU tests: loads, stores and atomics across windows |
-| **File system** | ✅ | console paths (`GAME:`, `G:`, `D:` …) → the game folder; writes go to an overlay, the game folder is never modified; the console's drives: `S:\` (persistent local storage) and `T:\` (temp) in the title's data folder; free disk space answered for console paths | end-to-end: the test title's folder stays byte-identical; PLS and free space through the real call path |
+- [Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/) with the **Desktop development with C++** workload and a Windows SDK.
+- [Rust](https://rustup.rs/) with the stable Windows MSVC toolchain.
+- [Git](https://git-scm.com/download/win).
+- [DirectX Shader Compiler](https://github.com/microsoft/DirectXShaderCompiler/releases) (if the Windows SDK does not provide a suitable DXC version).
 
-### System services
+Make sure Windows Gaming Services is installed through the Microsoft Store or Xbox app.
 
-| Feature | State | What it does | Verified by |
-|---|---|---|---|
-| **XGameRuntime** | ✅ | the GDK thunk protocol real titles use, laid out from a table of all 396 GDK runtime functions; offline XUser, XGameSave, persistent local storage, XPackage, XGame (title id), XSystem – the title sees an Xbox Series X / S; task queues, async, networking and dialogs through the PC's XGameRuntime | the game's libHttpClient initialises; users, saves and storage through the real call path; slot layout cross-checked against the game's own thunks |
-| **Input** | ✅ | GameInput: one gamepad – the PC's XInput controller, and keyboard and mouse as a gamepad (see [Controls](#controls)) | unit tests; an Xbox controller in Minecraft |
-| **Audio** | ✅ | XAudio2 → system XAudio2.9 (PCM / float voices; Opus 0x704F decoded via `MSOpusDecoder.dll`; XMA1 / XMA2 decoded in pure Rust) | unit + end-to-end tests |
+### 2. Build XCLayer
 
-### Graphics
-
-| Feature | State | What it does | Verified by |
-|---|---|---|---|
-| **Shader recompiler** | ✅ | RDNA2 → HLSL → DXIL: VS, PS, CS, mesh (NGG), GS; atomics, LDS, scratch, images, samplers incl. static ones, wave ops, ray-tracing instructions; structured control flow; parallel DXC, disk cache | 26 698 / 26 698 programs of the retail pack; 0 DXC errors on random samples; per-instruction GPU tests |
-| **Pipelines** | ✅ | PSOs from console shaders: VS+PS, CS, MS+PS, VS+GS+PS; root signature with the shaders' static samplers; non-blocking creation – a pipeline whose shaders are not compiled yet gets a stand-in at once and is built in the background | GPU tests drawing the game's own VS / PS pairs, also built in the background |
-| **D3D12.X compute** | ✅ | console device slots, console descriptor heaps (T# / V# / S#), buffers at their console addresses, compute command lists recorded in the console format and replayed (tables, barriers, clears, copies) | the game's BVH builder and FSR 4 record and run through XCL |
-| **D3D12.X graphics** | ✅ | device, resources and heaps (also placed in title memory), pipelines; the title's graphics command lists – draws, indirect draws, graphics root arguments, barriers, copies, clears – and command lists recorded by console code, replayed; `PresentX` and frame pacing into an XCL window | Minecraft Preview plays its worlds (millions of draws, none skipped); Fortnite and XDefiant draw their screens |
-| **Textures** | ✅ | GFX10 tiling (all 14 2D swizzle modes, the 6 3D thick modes, linear), mip chains with mip tail, arrays, cubes and 3D textures → PC textures | 909 / 912 retail textures exact (the 3 volume LUTs decode smooth); GPU upload bit exact |
-| **Ray tracing** | ✅ | BLAS / TLAS built on the GPU by the game's own XboxBvhBuilder; RDNA2 BVH node format; BVH intersection instructions emulated in shaders | GPU traversal = brute force reference; the game's builder output checked on the GPU |
-| **Upscaling** | ✅ | the game's AMD FSR 4 console DLL (`amd_fidelityfx_upscaler_xbox.dll`): context, the 29 pipelines in the console driver's own container (FSPX) translated, a frame's 20 passes recorded and run on the GPU | end-to-end with the real DLL: a 1280×720 → 1920×1080 frame on an RX 9070, the input's gradient in the output |
-
-### Media and tools
-
-| Feature | State | What it does | Verified by |
-|---|---|---|---|
-| **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |
-| **Tools** | ✅ | `xcl inspect`, `xcl run`, `xcl disasm` (RDNA2, console shader containers), `xcl shaders` (pack statistics, recompile / compile runs), `xcl rpf` | – |
-
-## Fork diagnostics (Patch 20)
-
-`detailed.txt` now includes `title_allocations`: live default XMem logical bytes, live logical physical-page bytes (a page is counted once regardless of its mapping), and explicitly committed bytes in tracked plain Windows virtual reservations. These categories are partial, not a total title-memory or host-commit figure; do not add them to process private bytes or GPU budgets. `TitleMemoryStatus` retains the existing policy and `XCL_TITLE_MEMORY_STRICT` override until all allocation paths are covered. `None` means a snapshot could not acquire its diagnostic lock.
-
-Title imports and title `GetProcAddress` lookups of the real `ntdll.dll!NtReadFile` / `NtWriteFile` prepare lazy data and metadata buffers, then call the native Windows API unchanged. Raw syscalls, other native file APIs and native path redirection are not implemented. Explicit resolver aliases continue to take precedence.
-
-A fresh, previously reserved plain-memory physical mapping of up to 64 MiB can stage its needed commits and roll them back if staging fails. Larger, overlapping and sparse mappings are not fully transactional. Failure to recommit a physical page's home now prevents unmapping that page. These fork changes require Windows and GPU regression validation.
-
-Patch 20 adds `resource_lifetime` (address-view resource count, retained title queues and deferred releases), `sparse_pool` (including retired heaps, mapped/pinned/free tiles and ring occupancy) and `bcpack_refused` (per-mode request and destination-byte counters) to `detailed.txt`. The snapshots are not additive memory accounting; `None` means the diagnostic lock was not acquired. The runtime still refuses unsupported BCPack requests. Failed CPU texture uploads are retried at most twice for the current upload, subject to active registration and GPU-write checks. No queue-retirement or arbitrary cache-eviction policy was added.
-
-Patch 21 serializes native sparse-memory decommits with GPU bookkeeping and preserves the reservation on a failed internal sparse free. Sparse readback rejects ranges that overflow or cross a non-sparse gap. Committed-only UMA fallback rejects totals that exceed the available window layout instead of truncating them. These paths still require Windows and GPU regression testing.
-
-Patch 22 separates fallback video-memory arenas by device, rejects sparse buffer placements with incomplete tile coverage, and validates texture write-watch range arithmetic. Windows and GPU regression testing are still required.
-
-Patch 23 reduces CPU-side overhead: DirectStorage workers reuse input staging (at most 8 MiB retained per worker), lazy page preparation batches lock acquisitions, DXIL flight registry cleanup is amortized, completed PSO binds avoid unnecessary build locks, and the deferred-release worker waits while idle. GPU synchronization and unsupported compression policy are unchanged. Windows regression tests and hardware profiling are required before claiming a performance improvement.
-
-Patch 24 reuses ranked shader signatures during parameter/attribute lookup and keeps an incremental total for the partial plain-virtual-memory diagnostic ledger. Shader linkage and title memory-budget policy are unchanged; Windows validation and hardware timings are pending.
-
-Patch 25 decodes BC1, BC3, BC4, BC5, BC6H and BC7 BCPack DirectStorage streams, including zlib-wrapped streams. It preserves block order for console texture uploads. BC2 and hardware swizzle options return a DirectStorage error. The patch also routes DirectStorage through paired GPU and CPU views, preserves CPU edits adjacent to sparse GPU readbacks, and fixes D3D12 mesh output sizing and same-window GPU copies. See [Patch 25 audit](PATCH25_AUDIT.md).
-
-## Controls
-
-A **gamepad is recommended**: console games are made for one, and their menus and controls expect it.
-
-- **Gamepad:** any controller Windows sees through XInput (Xbox controllers, wired or wireless) is the
-  game's gamepad – buttons, sticks, triggers and rumble. It can be plugged in or out while the game runs.
-- **Keyboard and mouse** work too, as a gamepad: WASD the left stick, the mouse the right stick, mouse
-  buttons the triggers, the wheel the bumpers, Enter / Space A, Escape / Backspace B, arrows the D-pad,
-  E / Q Y / X, Shift / Ctrl the stick clicks, Tab View, P Menu. `keyboard_mouse` and `mouse_sensitivity` in
-  the game's `xcl.toml` turn it off or change the mouse speed. A gamepad and the keyboard / mouse can be
-  used together.
-
-## Building and usage
-
-Windows 10/11 x64, Rust (`stable-x86_64-pc-windows-msvc`), the Windows SDK (DXC: `dxcompiler.dll`
-+ `dxil.dll`, looked up in `Windows Kits\10\bin\<version>\x64`, next to `xcl.exe` or in
-`%XCL_DXC_DIR%`), a D3D12 GPU with Shader Model 6.6 and mesh shaders, and the system XGameRuntime
-(`System32\xgameruntime.dll`, part of Windows / Gaming Services). On **Windows 10** (22H2
-KB5029331+), inbox `D3D12Core.dll` stops at SM 6.5; place the Microsoft D3D12 Agility SDK
-(`D3D12Core.dll`, plus `d3d12SDKLayers.dll` if using `XCL_D3D12_DEBUG=1`) in a `D3D12\` folder
-next to `xcl.exe`, directly next to `xcl.exe`, in `%LOCALAPPDATA%\XCL\D3D12\`, or point `%XCL_D3D12_DIR%` at it
-(for `cargo test`, use `%LOCALAPPDATA%\XCL\D3D12\` or `%XCL_D3D12_DIR%`).
-
-- **DXC:** 1.8 or newer is recommended, from the
-  [DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases): unpack one
-  and point `XCL_DXC_DIR` at its `bin\x64`. A Windows SDK may hold an older one (the same `10.0.26100.0`
-  folder has DXC 1.7.2308 or 1.8.2502, depending on the SDK's revision). DXC 1.7's DXIL was 2–2.7 times the
-  size of 1.9's for translated compute programs and took an NVIDIA driver 1.4–2.2 times as long to build
-  pipelines from ([#156](https://github.com/ivall/xcl/issues/156)). `xcl run` prints the DXC it loaded, and
-  `report.json` has it under `dxc`.
-- **System commit:** preflight warns when system-wide commit headroom is below 24 GiB. This is advisory, not a minimum requirement; check the system-managed Windows page file and available disk space.
-- **GPU:** developed on AMD RDNA4. The console's geometry and NGG programs run as a compute pass plus a
-  mesh pass, so a GPU without mesh shaders draws none of them. On GPUs with 32-lane waves only
-  (NVIDIA) console wave64 compute, geometry and mesh programs run as two 32-lane halves that exchange
-  masks and lane values ([`docs/wave64-on-wave32.md`](docs/wave64-on-wave32.md)) – slower than
-  64-lane waves, most for groups of several waves; wave64 vertex and pixel shaders that read lanes 32–63
-  can still differ there. Test results on other GPUs: [#42](https://github.com/ivall/xcl/issues/42).
+Open PowerShell and run:
 
 ```powershell
-cargo build --release --workspace          # target\release\xcl.exe
+rustup toolchain install stable-x86_64-pc-windows-msvc
+rustup default stable-x86_64-pc-windows-msvc
 
-xcl inspect D:\Game\game.exe               # the game's imports and what XCL has for them
-xcl run D:\Game [-- game arguments]        # run
-xcl disasm <shader.bin> [--hex]            # RDNA2 disassembler (console containers too)
-xcl shaders D:\data\shaders.rpf --top 50   # pack statistics; --recomp / --compile N
-xcl rpf D:\data\shaders.rpf --extract NAME --out folder
+git clone https://github.com/w1spo/xclayer.git
+cd xclayer
+cargo build --release --workspace --locked
 ```
 
-- **Without a command line** (xcl.exe opened from Explorer) XCL shows a small menu: *Choose a
-  game…* (pick its exe or `MicrosoftGame.config`) or *Run again* (the last one). On an error the
-  window stays open until Enter.
-- XCL works on **unpacked** game files you own; it contains nothing for decrypting or
-  circumventing DRM.
-- **The game folder is never modified** – writes go to the overlay.
-- Translated shaders are reused across XCL rebuilds when the translator sources and DXC
-  toolchain are unchanged; `XCL_TRANSLATED_CACHE=0` disables that disk cache.
-- Every run writes `report.json` (called stubs, unknown D3D12.X slots and interfaces, XGameRuntime
-  classes asked for, shader statistics, audio formats, crash).
-  `d3d12.presents` counts presentations, not visible content. With `XCL_FRAME_DUMP=N` (`N > 1`),
-  the existing optional frame dumps also set `d3d12.last_frame_dump`: the latest sampled frame's
-  zero-based index, source dimensions, DXGI format, sample step, sample count and `non_dark_samples`
-  (decoded 8-bit R+G+B > 30). The field is `null` until a frame is sampled; `non_dark_samples` is
-  `null` if its format cannot be decoded. Intermediate render-target dumps do not update it.
-  Sampling uses every fourth pixel in each direction (`XCL_FRAME_DUMP_FULL=1`: every pixel).
-  A coarse sample can miss detail; a non-dark sample does not establish correct rendering or gameplay.
-- Title data: `%LOCALAPPDATA%\XCL\<title>\` (`%XCL_DATA_ROOT%`): `xcl.toml`, `overlay\`, `saves\`,
-  `pls\` (the title's `S:\`), `temp\` (`T:\`), `cache\`, `logs\xcl.log`, `logs\report.json` (the
-  previous run's: `xcl.prev.log`, `report.prev.json`).
+The executable will be generated at:
 
-## Tests
+```text
+target\release\xcl.exe
+```
+
+Prebuilt binaries, when published, can be found under [Releases](https://github.com/w1spo/xclayer/releases). Otherwise, build from source as described above.
+
+### 3. Configure DirectX
+
+If using a standalone DXC distribution, extract it and set the path to the directory containing `dxcompiler.dll` and `dxil.dll`:
 
 ```powershell
-.\scripts\test.ps1                         # cargo build --workspace + cargo test --workspace
+$env:XCL_DXC_DIR = 'C:\Tools\DXC\bin\x64'
 ```
 
-Unit tests, an end-to-end test with our own "console title" (`tests/testtitle`) and GPU tests
-(D3D12, SM 6.6; skipped without a GPU / DXC; `XCL_ADAPTER=1` or `XCL_ADAPTER=radeon` picks
-another adapter than the first high-performance one, for titles too). A GPU test that cannot run on
-the adapter (no GPU / DXC / wave64 / mesh shaders) passes too, but prints `SKIPPED <test>: <reason>`, and
-`scripts/test.ps1` counts them at the end; `XCL_REQUIRE_GPU=wave64` (or `mesh`, or `wave64,mesh`) makes
-those skips fail. Tests on real game data are opt-in through
-environment variables pointing at your own files – `XCL_SAMPLE_RPF` (shader pack),
-`XCL_SAMPLE_DLLS` (the game's console DLLs), `XCL_SAMPLE_TTPF` (texture archive),
-`XCL_SAMPLE_BK2` (a movie), `XCL_SAMPLE_BVH4`, `XCL_SAMPLE_AWC` (a sound) – described in `HANDOFF.md`; without them those
-tests pass without running anything (`scripts/test.ps1` lists the ones not set). No game data is
-part of the repository.
+Replace the example directory with the actual location. These PowerShell environment settings apply to the current session.
 
-## Licenses
+On Windows 10, the [Direct3D 12 Agility SDK](https://devblogs.microsoft.com/directx/directx12agility/) is required for Shader Model 6.6. Place the compatible `D3D12Core.dll` in a `D3D12` directory alongside `xcl.exe`, or set `XCL_D3D12_DIR` to the directory containing it. Include the matching SDK layers DLL if enabling the D3D12 debug layer.
 
-**GPL-2.0-only** (`LICENSE`); third-party sources: `THIRD_PARTY.md` (including AMD's
-machine-readable ISA, AMD addrlib swizzle patterns, LLVM disassembler tests, AnyPS5,
-libHttpClient headers). WinDurango serves only as a reference – no code is ported from it. The
-repository contains no headers or binaries from the console SDK.
+## Usage
+
+XCLayer requires legally obtained, unpacked game files. It does not decrypt packages or bypass DRM.
+
+Launch `xcl.exe` to open the game selection menu, or use PowerShell from the repository directory:
+
+```powershell
+.\target\release\xcl.exe inspect 'D:\Games\Example\game.exe'
+.\target\release\xcl.exe run 'D:\Games\Example'
+```
+
+The original game directory remains unchanged. Saves, configuration, shader caches and other writable data are stored separately.
+
+### Controls
+
+An XInput-compatible controller is recommended. Keyboard and mouse input can also emulate a controller; configure `keyboard_mouse` and `mouse_sensitivity` in the title's `xcl.toml`.
+
+| Input | Controller equivalent |
+| --- | --- |
+| WASD / Mouse | Left / right stick |
+| Mouse buttons / wheel | Triggers / bumpers |
+| Enter or Space / Escape or Backspace | A / B |
+| E / Q | Y / X |
+| Arrow keys | D-pad |
+| Shift / Ctrl | Stick clicks |
+| Tab / P | View / Menu |
+
+## Compatibility
+
+The following results are reported by the upstream XCL project. They are not independent validation of the current XCLayer revision.
+
+| Title | Reported status |
+| --- | --- |
+| Minecraft Preview | Playable |
+| Unicorn Overlord | Playable |
+| Fortnite | Limited by online-service requirements |
+| XDefiant | Limited by discontinued online services |
+| Other retail titles | Experimental; no general gameplay guarantee |
+
+## Features
+
+- Native x64 execution and console PE loading, including imports, TLS and exception handling.
+- High-level implementations of console kernel, runtime, storage, input and audio interfaces.
+- RDNA2 shader recompilation, asynchronous pipeline compilation and persistent shader caching.
+- Direct3D 12 graphics and compute translation, texture detiling and GPU memory management.
+- Experimental mesh shaders, ray tracing and console upscaling support.
+- BCPack decoding for BC1, BC3, BC4, BC5, BC6H and BC7 streams; BC2 and hardware swizzle options remain unsupported.
+- Diagnostic tooling for memory allocation, resource lifetime, streaming and graphics errors.
+
+## Troubleshooting
+
+Title-specific data is stored at:
+
+```text
+%LOCALAPPDATA%\XCL\<title>\
+```
+
+| File or directory | Purpose |
+| --- | --- |
+| `xcl.toml` | Title configuration |
+| `logs/xcl.log` | Runtime log |
+| `logs/report.json` | Compatibility and crash diagnostics |
+| `overlay/` | Redirected game writes |
+| `saves/` | Saved game data |
+| `cache/` | Cached runtime data |
+
+If startup fails, check the DXC version, GPU capabilities, Gaming Services and available system commit. The runtime's 24 GiB commit-headroom warning is advisory, not a fixed RAM requirement.
+
+When reporting a problem, include the XCLayer commit, Windows version, GPU, driver version, title version and relevant logs. Remove personal information and do not attach game binaries or copyrighted game assets.
+
+## Development
+
+Run the existing test suite from the repository root:
+
+```powershell
+.\scripts\test.ps1
+```
+
+GPU tests require compatible hardware and DXC. Some tests are skipped when their hardware or sample-data prerequisites are absent; a successful test command alone does not establish full compatibility.
+
+- [Technical handoff](HANDOFF.md)
+- [Architecture and design](docs/specs/2026-11-20-xcl-design.md)
+- [Wave64 translation](docs/wave64-on-wave32.md)
+- [Patch 25 engineering notes](PATCH25_AUDIT.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
+## License
+
+XCLayer is distributed under the [GPL-2.0-only license](LICENSE). See [THIRD_PARTY.md](THIRD_PARTY.md) for third-party notices and attribution.
+
+Based on the original [XCL project](https://github.com/ivall/xcl). XCLayer is an independent fork and is not affiliated with Microsoft or Xbox. No game files or proprietary console SDK binaries are included.
